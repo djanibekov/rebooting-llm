@@ -30,6 +30,7 @@ from fairseq.tasks import LegacyFairseqTask, register_task
 from fairseq.tasks.hubert_pretraining import LabelEncoder 
 
 import speech_adapter.criterions.speech_to_text_loss
+import speech_adapter.criterions.speech_qformer_loss
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +111,12 @@ class SpeechAdapterTask(LegacyFairseqTask):
             type=str,
             help="name of the llama version",
         )
+        parser.add_argument(
+            "--qformer_dim",
+            default=None,
+            type=int,
+            help="Q former dimension",
+        )
        
     def __init__(self, args, dicts, config):
         super().__init__(args)
@@ -154,7 +161,7 @@ class SpeechAdapterTask(LegacyFairseqTask):
             manifest,
             sample_rate=self.args.sample_rate,
             label_paths=paths,
-            max_keep_sample_size=self.max_pos[0] if self.args.max_speech_sample_size is None else self.args.max_speech_sample_size,
+            max_keep_sample_size=None,
             min_keep_sample_size=self.args.min_speech_sample_size,
             normalize=False,
             store_labels=False,

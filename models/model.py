@@ -8,6 +8,7 @@
 # --------------------------------------------------------
 
 import logging
+import contextlib
 from ast import literal_eval
 from typing import Dict, List, Optional, Tuple
 
@@ -32,6 +33,8 @@ from torch import Tensor
 from transformers import LlamaTokenizer
 from .llama import LlamaForCausalLM
 
+from .q_former import BertConfig, BertLMHeadModel
+
 from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
@@ -53,18 +56,47 @@ class T5TransformerModel(FairseqEncoderDecoderModel):
             args,
             encoder,
             decoder,
-            speech_encoder_prenet
+            speech_encoder_prenet,
+            num_query_token=64,
+            drop=False
         ):
         super().__init__(encoder, decoder)
 
         # self.encoder = encoder
-        self.decoder = decoder
-
+        # self.decoder = decoder
         self.speech_encoder_prenet = speech_encoder_prenet
-
-        # self.reduction_factor = args.reduction_factor
-        self.num_updates = 0
+        self.speech_transformation = nn.Linear(1024, 768)
+        self.drop = True
         # breakpoint()
+
+        print('Loading Q-Former dropout:', self.drop)
+        self.Qformer, self.audio_query_tokens = self.init_Qformer(
+            num_query_token, self.speech_encoder_prenet.config['codebook_size'], drop=self.drop
+        )
+        self.device = self.audio_query_tokens.device
+        # self.audio_query_tokens = nn.Parameter(
+        #     torch.zeros(1, num_query_token, self.audio_query_tokens.shape[-1])
+        # )
+        self.Qformer.cls = None
+        self.Qformer.bert.embeddings.word_embeddings = None
+        self.Qformer.bert.embeddings.position_embeddings = None
+        for layer in self.Qformer.bert.encoder.layer:
+            layer.output = None
+            layer.intermediate = None
+        # self.load_from_pretrained(url_or_filename=q_former_model)
+
+        # if freeze_qformer:
+        #     for name, param in self.Qformer.named_parameters():
+        #         param.requires_grad = False
+        #     self.Qformer = self.Qformer.eval()
+        #     self.Qformer.train = disabled_train
+        #     self.image_query_tokens.requires_grad = False
+        #     self.audio_query_tokens.requires_grad = False
+        #     for name, param in self.audio_trans.named_parameters():
+        #         param.requires_grad = False
+        #     logging.info("freeze Qformer")
+        print('Loading Q-Former Done')
+
 
         print('Loading LLAMA')
         self.llama_tokenizer = LlamaTokenizer.from_pretrained(args.llama_model, use_fast=False)
@@ -79,9 +111,8 @@ class T5TransformerModel(FairseqEncoderDecoderModel):
             param.requires_grad = False
         print('Loading LLAMA Done')
 
-        self.llama_proj = nn.Linear(
-            self.speech_encoder_prenet.config['codebook_size'], self.llama_model.config.hidden_size
-        )
+        self.llama_proj = nn.Linear(768, 4096)
+        self.end_sym = '\n'
 
 
     @staticmethod
@@ -242,6 +273,23 @@ class T5TransformerModel(FairseqEncoderDecoderModel):
             speech_encoder_prenet
         )
 
+    @classmethod
+    def init_Qformer(cls, num_query_token, modality_width, cross_attention_freq=2, drop=True):
+        encoder_config = BertConfig.from_pretrained("bert-base-uncased")
+        encoder_config.encoder_width = modality_width
+        encoder_config.add_cross_attention = True
+        encoder_config.cross_attention_freq = cross_attention_freq
+        encoder_config.query_length = num_query_token
+        if not drop:
+            encoder_config.hidden_dropout_prob = 0.0
+            encoder_config.attention_probs_dropout_prob = 0.0
+        Qformer = BertLMHeadModel(config=encoder_config)
+        query_tokens = nn.Parameter(
+            torch.zeros(1, num_query_token, encoder_config.hidden_size)
+        )
+        query_tokens.data.normal_(mean=0.0, std=encoder_config.initializer_range)
+        return Qformer, query_tokens
+
     def get_normalized_probs(
         self,
         net_output: Tuple[Tensor, Optional[Dict[str, List[Optional[Tensor]]]]],
@@ -320,85 +368,86 @@ class T5TransformerModel(FairseqEncoderDecoderModel):
         argument in its input, which is not supported in torchscript. This
         method overwrites the forward method definition without **kwargs.
         """
-        # breakpoint()
+        self.llama_tokenizer.padding_side = "right"
+        batch_size = len(source)
+        device = source[0].device
         assert source is not None or src_tokens is not None
-        input_type = 'speech'
+        # encoded_speech = []
+        # processed_target = []
+        # for i in range(batch_size):
+        #     temp = self.speech_encoder_prenet(source[i].unsqueeze(0))
+        #     if temp is not None:
+        #         encoded_speech.append(temp)
+        #         processed_target.append(target[0][i])
 
-        # if prev_output_tokens is not None and len(prev_output_tokens.size()) == 2:
-        #     output_type = 'text'
-        # else:
-        #     raise NotImplemented
-
-        # # Encoder Prenet
-        # if input_type == 'text':
-        #     raise NotImplemented
-        # else:
-        encoded_speech = self.speech_encoder_prenet(source)
-
-        # batch_size = encoded_speech.shape[0]
         
-        # # # Decoder Prenet
-        # if output_type == 'text':
-        #     prev_output_tokens, tgt_mask, _ = self.text_decoder_prenet(prev_output_tokens)
-        #     # _ is the incremental state
-        # else:
-        #     raise NotImplemented
+        
+        # audio_size = max([s.shape[1] for s in encoded_speech])
+        # collated_speech = encoded_speech[0].new_zeros(len(encoded_speech), audio_size, 1024)
+        # padding_mask = (torch.BoolTensor(collated_speech.shape[:2]).fill_(False))
+        # # breakpoint()
+        # for i, audio in enumerate(encoded_speech):
+        #     diff = audio.shape[1] - audio_size
+        #     batch, timestamp, dim = audio.shape
+        #     if diff == 0:
+        #         collated_speech[i] = audio
+        #     elif diff < 0:
+        #         # breakpoint()
+        #         collated_speech[i] = torch.cat([audio, audio.new_full((batch,-diff,dim), 0.0)], dim=1)
+        #         padding_mask[i, -diff:] = True
+        #     else:
+        #         raise Exception("Diff should not be larger than 0")
 
-        # # if "decoder_input" in encoder_output and encoder_output["decoder_input"][0] is not None:
-        # #     # Change the encoder output to decoder input once set unb-enc-layer
-        # #     encoder_output["encoder_out"] = encoder_output["decoder_input"]
+        collated_speech = self.speech_encoder_prenet(source.unsqueeze(1))
+        # encoded_speech = torch.cat(encoded_speech, dim=0)
+        # breakpoint()
+        # audio_atts = torch.ones(collated_speech.size()[:-1], dtype=torch.long).to(device)
+        query_tokens = self.audio_query_tokens.expand(collated_speech.shape[0], -1, -1)
+        query_output = self.Qformer.bert(query_embeds=query_tokens,encoder_hidden_states=collated_speech,encoder_attention_mask=None,return_dict=True)    
+        
+        aud_embeds = self.llama_proj(query_output.last_hidden_state)
+        atts_llama = torch.ones(aud_embeds.size()[:-1], dtype=torch.long).to(collated_speech.device)
+        to_regress_tokens = self.llama_tokenizer(target[0],return_tensors="pt",padding="longest",truncation=True,max_length=200,add_special_tokens=False).to(device)
+        
+        # breakpoint()
 
-        # # Decoder
-        # hiddent_representations, extra = self.decoder(
-        #     prev_output_tokens, tgt_mask, encoded_speech, 
-        #     full_context_alignment=getattr(self.args, "decoder_full_context_alignment", False), 
-        #     alignment_layer=(-1 if target_list is None and output_type == 'speech' else None)
-        # )
-        #########
-
-        device = source.device
-        # with self.maybe_autocast():     
-        # breakpoint()  
-        aud_embeds  = self.llama_proj(encoded_speech)
-        atts_aud = torch.ones(aud_embeds.size()[:-1], dtype=torch.long).to(device)
-
-        to_regress_tokens = self.llama_tokenizer(
-            target[0],
-            return_tensors="pt",
-            padding="longest",
-            truncation=True,
-            max_length=200,
-            add_special_tokens=False
-        ).to(device)
-
-        targets = to_regress_tokens.input_ids.masked_fill(
-            to_regress_tokens.input_ids == self.llama_tokenizer.pad_token_id, -100
-        )
-        empty_targets = (
-            torch.ones([atts_aud.shape[0], atts_aud.shape[1]+1],
-                    dtype=torch.long).to(device).fill_(-100)  # plus one for bos
-        )
+        targets = to_regress_tokens.input_ids.masked_fill(to_regress_tokens.input_ids == self.llama_tokenizer.pad_token_id, -100)
+        empty_targets = (torch.ones([atts_llama.shape[0], atts_llama.shape[1]+1],dtype=torch.long).to(device).fill_(-100))  # plus one for bos
+        
         targets = torch.cat([empty_targets, targets], dim=1)
+        
         batch_size = aud_embeds.shape[0]
-        bos = torch.ones([batch_size, 1],
-                        dtype=to_regress_tokens.input_ids.dtype,
-                        device=to_regress_tokens.input_ids.device) * self.llama_tokenizer.bos_token_id
-        bos_embeds = self.llama_model.model.embed_tokens(bos)
-        atts_bos = atts_aud[:, :1]
-        to_regress_embeds = self.llama_model.model.embed_tokens(to_regress_tokens.input_ids)
-        inputs_embeds = torch.cat([bos_embeds, aud_embeds, to_regress_embeds], dim=1)
-        attention_mask = torch.cat([atts_bos, atts_aud, to_regress_tokens.attention_mask], dim=1)
 
-        # with self.maybe_autocast():
-        outputs = self.llama_model(
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            return_dict=True,
-            labels=targets,
-        )
+        bos = torch.ones([batch_size, 1],dtype=to_regress_tokens.input_ids.dtype, device=to_regress_tokens.input_ids.device) * self.llama_tokenizer.bos_token_id
+        bos_embeds = self.llama_model.model.embed_tokens(bos)
+
+        atts_bos = atts_llama[:, :1]
+        to_regress_embeds = self.llama_model.model.embed_tokens(to_regress_tokens.input_ids)
+
+        inputs_embeds = torch.cat([bos_embeds, aud_embeds, to_regress_embeds], dim=1)
+        attention_mask = torch.cat([atts_bos, atts_llama, to_regress_tokens.attention_mask], dim=1)
+
+        with self.maybe_autocast():
+            outputs = self.llama_model(
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                return_dict=True,
+                labels=targets,
+            )
         loss = outputs.loss
+        # breakpoint()
 
         return {"loss": loss, 'output': outputs}
+
+    def maybe_autocast(self, dtype=torch.float16):
+        # if on cpu, don't use autocast
+        # if on gpu, use autocast with dtype if provided, otherwise use torch.float16
+        enable_autocast = self.device != torch.device("cpu")
+
+        if enable_autocast:
+            return torch.cuda.amp.autocast(dtype=dtype)
+        else:
+            return contextlib.nullcontext()
 
 
     def forward_encoder_torchscript(self, net_input: Dict[str, Tensor]):

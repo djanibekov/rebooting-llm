@@ -9,17 +9,47 @@
 
 import logging
 import torch
+import json
 from typing import List, Tuple
 import torch.nn as nn
 
 import numpy as np
 from models.speechtokenizer import SpeechTokenizer
+from collections import Counter
 
-import json
-
-
+from fairseq.modules import (
+    LayerNorm,
+    FairseqDropout,
+)
+import torch.nn.functional as F
+import torch.nn as nn
 
 logger = logging.getLogger(__name__)
+
+class Adapter(nn.Module):
+    """
+    Adapter for model finetuning, as described in:
+    https://arxiv.org/pdf/1909.08478.pdf
+    """
+
+    def __init__(self, embed_dim, proj_dim, dropout):
+        super().__init__()
+        self.layer_norm = nn.LayerNorm(embed_dim)
+        self.down_proj = nn.Linear(embed_dim, proj_dim)
+        self.up_proj = nn.Linear(proj_dim, embed_dim)
+        self.dropout_module = FairseqDropout(
+            dropout, module_name=self.__class__.__name__
+        )
+
+    def forward(self, x):
+        residual = x
+        x = self.layer_norm(x)
+        x = self.down_proj(x)
+        x = F.relu(x)
+        x = self.up_proj(x)
+        x = self.dropout_module(x)
+        x += residual
+        return x
 
 class SpeechEncoderPrenet(nn.Module):
     def __init__(
@@ -46,19 +76,28 @@ class SpeechEncoderPrenet(nn.Module):
         for name, param in self.speech_model.named_parameters():
             param.requires_grad = False
         print('Loading SpeechTokenizer Done')
+        default_dtype = torch.get_default_dtype()
+        self.adapter = Adapter(
+            self.config['codebook_size'],
+            64,
+            args.dropout
+        )
 
         
     def forward(self, source, padding_mask=None, **kwargs):
         # breakpoint()
-        with torch.no_grad():
-            return self._forward(source, padding_mask)
+        return self._forward(source, padding_mask)
 
 
     def _forward(self, source, padding_mask=None):
         # breakpoint()
-        codes = self.speech_model.encode(source.unsqueeze(1), 1) # codes: (n_q, B, T)
+        codes = self.speech_model.encode(source, 1) # codes: (n_q, B, T)
         # RVQ_1 = codes[:1, :, :] # Contain content info, can be considered as semantic tokens
         # RVQ_supplement = codes[1:, :, :] # Contain timbre info, complete info lost by the first quantizer
+        if torch.unique(codes).numel() < 0.20 * codes.shape[-1]:
+            logging.info('Non-unique tensor is detected')
+            breakpoint()
+            return None
 
         x = self.speech_model.quantizer.decode(codes)  # (B, C, T)
         x = x.transpose(1, 2)  # Changes shape from (B, C, T) to (B, T, C)

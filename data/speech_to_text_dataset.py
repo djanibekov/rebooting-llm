@@ -13,6 +13,7 @@ import os
 from typing import Any, List, Optional
 
 import numpy as np
+import torchaudio
 
 import torch
 import torch.nn.functional as F
@@ -109,13 +110,15 @@ class SpeechToTextDataset(FairseqDataset):
         )
 
     def get_audio(self, index):
-        import soundfile as sf
+        # import soundfile as sf
 
         wav_path = os.path.join(self.audio_root, self.audio_names[index])
-        wav, cur_sample_rate = sf.read(wav_path)
-        wav = torch.from_numpy(wav).float()
-        wav = self.postprocess(wav, cur_sample_rate)
-        return wav
+        # wav, cur_sample_rate = sf.read(wav_path)
+        # wav = torch.from_numpy(wav).float()
+        wav, sr = torchaudio.load(wav_path)
+        # print(wav.shape, '-->', wav_path)
+        # wav = self.postprocess(wav, cur_sample_rate)
+        return wav.squeeze()
 
     def get_label(self, index, label_idx):
         if self.store_labels:
@@ -160,7 +163,7 @@ class SpeechToTextDataset(FairseqDataset):
         targets_by_label = [
             [s["label_list"][i] for s in samples] for i in range(self.num_labels)
         ]
-        # targets_list, lengths_list, ntokens_list = self.collater_label(targets_by_label)
+        lengths_list, ntokens_list = self.collater_label(targets_by_label)
 
         # decoder_label = [
         #     torch.cat((targets_list[0][i, :lengths_list[0][i]], torch.tensor([self.tgt_dict.eos()])), 0).long()
@@ -198,7 +201,7 @@ class SpeechToTextDataset(FairseqDataset):
             "target": targets_by_label,
             # "target_lengths": decoder_target_lengths,
             "task_name": "s2t",
-            # "ntokens": ntokens_list[0]
+            "ntokens": ntokens_list[0]
         }
 
         return batch
@@ -222,18 +225,17 @@ class SpeechToTextDataset(FairseqDataset):
     def collater_seq_label(self, targets, pad):
         lengths = torch.LongTensor([len(t) for t in targets])
         ntokens = lengths.sum().item()
-        targets = data_utils.collate_tokens(targets, pad_idx=pad, left_pad=False)
-        return targets, lengths, ntokens
+        # targets = data_utils.collate_tokens(targets, pad_idx=pad, left_pad=False)
+        return lengths, ntokens
 
     def collater_label(self, targets_by_label):
-        targets_list, lengths_list, ntokens_list = [], [], []
-        itr = zip(targets_by_label, [self.tgt_dict.pad()])
+        lengths_list, ntokens_list = [], []
+        itr = zip(targets_by_label, [-100])
         for targets, pad in itr:
-            targets, lengths, ntokens = self.collater_seq_label(targets, pad)
-            targets_list.append(targets)
+            lengths, ntokens = self.collater_seq_label(targets, pad)
             lengths_list.append(lengths)
             ntokens_list.append(ntokens)
-        return targets_list, lengths_list, ntokens_list
+        return lengths_list, ntokens_list
 
     def num_tokens(self, index):
         return self.size(index)

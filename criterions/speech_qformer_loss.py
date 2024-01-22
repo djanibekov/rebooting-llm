@@ -9,8 +9,8 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-@register_criterion("speech_adapter")
-class SpeechtoTextLoss(FairseqCriterion):
+@register_criterion("speech_qformer")
+class SpeechtoQformerLoss(FairseqCriterion):
     def __init__(
         self,
         task: FairseqTask
@@ -19,23 +19,30 @@ class SpeechtoTextLoss(FairseqCriterion):
         super().__init__(task)
 
     def forward(self, model, sample, reduce=True):
-        output = model(**sample["net_input"])
+        output = model(sample["net_input"])
         ntokens = sample["ntokens"]
 
         sample_size = len(sample["target"])
         loss = output['loss']
+        loss_itc = output['loss_itc']
+        loss_itm = output['loss_itm']
+        loss_lm = output['loss_lm']
+
         # breakpoint()
 
         logging_output = {
             "loss": output['loss'].item(),
+            "loss_itc": output['loss_itc'].item(),
+            "loss_itm": output['loss_itm'].item(),
+            "loss_lm": output['loss_lm'].item(),
             "ntokens": sample["ntokens"],
             "nsentences": len(sample["target"][0]),
             "sample_size": sample_size,
         }
-        print(logging_output)
+        # print(logging_output)
 
-        if torch.isinf(loss):
-            raise NotImplemented
+        # if torch.isinf(loss):
+        #     raise NotImplemented
 
         return loss, sample_size, logging_output
 
@@ -54,6 +61,9 @@ class SpeechtoTextLoss(FairseqCriterion):
         """Aggregate logging outputs from data parallel training."""
 
         loss_sum = utils.item(sum(log.get("loss", 0) for log in logging_outputs))
+        loss_itc_sum = utils.item(sum(log.get("loss_itc", 0) for log in logging_outputs))
+        loss_itm_sum = utils.item(sum(log.get("loss_itm", 0) for log in logging_outputs))
+        loss_lm_sum = utils.item(sum(log.get("loss_lm", 0) for log in logging_outputs))
         # nll_loss_sum = sum(log.get("nll_loss", 0) for log in logging_outputs)
         # ce_loss_sum = sum(log.get("ce_loss", 0) for log in logging_outputs)
         # ctc_loss_sum = sum(log.get("ctc_loss", 0) for log in logging_outputs)
