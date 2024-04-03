@@ -64,39 +64,24 @@ class SpeechEncoderPrenet(nn.Module):
         with open(args.speechtokenizer_configpath) as config_file:
             self.config = json.load(config_file)
 
-        # logger.info(f"\n{self.speech_model}")
-
         print('Loading SpeechTokenizer')
         self.speech_model = SpeechTokenizer.load_from_checkpoint(
             args.speechtokenizer_configpath, args.speechtokenizer_ckptpath
         ).to(self.device)
-        self.speech_model.eval()
         self.prune_modules()
-
-        for name, param in self.speech_model.named_parameters():
-            param.requires_grad = False
-        print('Loading SpeechTokenizer Done')
-        default_dtype = torch.get_default_dtype()
-        self.adapter = Adapter(
-            self.config['codebook_size'],
-            64,
-            args.dropout
-        )
+        self.speech_model.eval()
 
         
     def forward(self, source, padding_mask=None, **kwargs):
-        # breakpoint()
         return self._forward(source, padding_mask)
 
 
     def _forward(self, source, padding_mask=None):
-        # breakpoint()
         codes = self.speech_model.encode(source, 1) # codes: (n_q, B, T)
         # RVQ_1 = codes[:1, :, :] # Contain content info, can be considered as semantic tokens
         # RVQ_supplement = codes[1:, :, :] # Contain timbre info, complete info lost by the first quantizer
         if torch.unique(codes).numel() < 0.20 * codes.shape[-1]:
             logging.info('Non-unique tensor is detected')
-            breakpoint()
             return None
 
         x = self.speech_model.quantizer.decode(codes)  # (B, C, T)

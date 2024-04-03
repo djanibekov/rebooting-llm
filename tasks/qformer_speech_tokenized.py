@@ -24,58 +24,26 @@ from fairseq.data import (
 )
 from fairseq.data.encoders.utils import get_whole_word_mask
 from fairseq import utils
-from speech_adapter.data.speech_to_text_dataset import SpeechToTextDataset
+from speechqformer_fairseq.data.speech_to_text_dataset_tokenizer import SpeechToTextDatasetTokenizer
 from fairseq.data.shorten_dataset import maybe_shorten_dataset
 from fairseq.tasks import LegacyFairseqTask, register_task
 from fairseq.tasks.hubert_pretraining import LabelEncoder 
 
-import speech_adapter.criterions.speech_to_text_loss
-import speech_adapter.criterions.speech_qformer_loss
+import speechqformer_fairseq.criterions.speech_to_text_loss
+import speechqformer_fairseq.criterions.speech_qformer_loss
+
+from transformers import BertTokenizer
 
 logger = logging.getLogger(__name__)
 
 # logging.disable('WARNING')
 
 
-@register_task("speech_adapter")
-class SpeechAdapterTask(LegacyFairseqTask):
+@register_task("qformer_speech_toknized")
+class QformerSpeechTaskTokenized(LegacyFairseqTask):
     @staticmethod
     def add_args(parser):
         parser.add_argument("data", help="manifest root path")
-        parser.add_argument(
-            "--config-yaml",
-            type=str,
-            default="config.yaml",
-            help="Configuration YAML filename (under manifest root)",
-        )
-        parser.add_argument(
-            "--max-speech-sample-size",
-            default=None,
-            type=int,
-            metavar="N",
-            help="max speech sample size",
-        )
-        parser.add_argument(
-            "--min-speech-sample-size",
-            default=None,
-            type=int,
-            metavar="N",
-            help="min speech sample size",
-        )
-        parser.add_argument(
-            "--max-speech-positions",
-            default=4000,
-            type=int,
-            metavar="N",
-            help="max number of tokens in the source sequence",
-        )
-        parser.add_argument(
-            "--max-text-positions",
-            default=450,
-            type=int,
-            metavar="N",
-            help="max number of tokens in the target sequence",
-        )
         parser.add_argument(
             "--sample-rate",
             default=100,
@@ -83,39 +51,26 @@ class SpeechAdapterTask(LegacyFairseqTask):
             help="target sample rate. audio files will be up/down sampled to this rate",
         )
         parser.add_argument(
-            "--random-crop",
-            action="store_true",
-            help="always crop from the beginning if false",
-        )
-        parser.add_argument(
-            "--batch-ratio",
-            default=None,
-            type=str,
-            help="ratio of bach size for each dataset",
-        )
-        parser.add_argument(
-            "--speechtokenizer_configpath",
+            "--speechtokenizer-configpath",
             default=None,
             type=str,
             help="path to the config file",
         )
         parser.add_argument(
-            "--speechtokenizer_ckptpath",
+            "--speechtokenizer-ckptpath",
             default=None,
             type=str,
             help="path to the checkpoint file",
         )
         parser.add_argument(
-            "--llama-model",
-            default=None,
-            type=str,
-            help="name of the llama version",
+            "--max-speech-sample-size",
+            default=16000 * 30,
+            type=int,
         )
         parser.add_argument(
-            "--qformer_dim",
-            default=None,
+            "--min-speech-sample-size",
+            default=16000,
             type=int,
-            help="Q former dimension",
         )
        
     def __init__(self, args, dicts, config):
@@ -126,26 +81,6 @@ class SpeechAdapterTask(LegacyFairseqTask):
 
     @classmethod
     def setup_task(cls, args, **kwargs):
-        # load dictionaries and config
-        # dicts = OrderedDict()
-        # if args.t5_task == 'pretrain' and not hasattr(args, "shuffle_instance"):
-        #     args.shuffle_instance = False
-
-        # # Prepare config
-        # config = None
-        # logger.info('No config file for ' + args.t5_task)
-
-        # if args.t5_task == "pretrain":
-        #     dicts["hubert"] = [Dictionary.load(f"{args.hubert_label_dir}/dict.{label}.txt") for label in args.hubert_labels]
-        #     dicts["text"] = Dictionary.load(op.join(args.data, "dict.txt"))
-        # else:
-        #     if config is None:
-        #         dicts["text"] = Dictionary.load(op.join(args.data, "dict.txt"))
-        #     else:
-        #         dicts["text"] = Dictionary.load(op.join(args.data, config.vocab_filename))
-
-        
-
         return cls(args, None, None)
 
     def build_criterion(self, args):
@@ -155,18 +90,17 @@ class SpeechAdapterTask(LegacyFairseqTask):
     def load_dataset(self, split, epoch=1, combine=False, **kwargs):
         speech_split, text_split = split.split('|')
         manifest = f"{self.args.data}/{speech_split}.tsv"
-        # procs = [LabelEncoder(self.dicts["text"])]
         paths = [f"{self.args.data}/{text_split}.txt"]
-        self.datasets[split] = SpeechToTextDataset(
+        self.datasets[split] = SpeechToTextDatasetTokenizer(
             manifest,
             sample_rate=self.args.sample_rate,
             label_paths=paths,
-            max_keep_sample_size=None,
+            max_keep_sample_size=self.args.max_speech_sample_size,
             min_keep_sample_size=self.args.min_speech_sample_size,
             normalize=False,
             store_labels=False,
-            tgt_dict=None,
-            tokenizer=None,
+            speechtokenizer_configpath=self.args.speechtokenizer_configpath,
+            speechtokenizer_ckptpath=self.args.speechtokenizer_ckptpath
         )
        
     def train_step(
@@ -175,9 +109,7 @@ class SpeechAdapterTask(LegacyFairseqTask):
         model.train()
         model.set_num_updates(update_num)
 
-        # Junyi: not use sample_size, but normalize the loss locally
         agg_loss, agg_sample_size, agg_logging_output = 0.0, 1.0, {}
-        agg_logging_output['sample_size'] = 1
 
         def forward_backward(model, samples, weight=1.0):
             nonlocal agg_loss, agg_logging_output
@@ -197,13 +129,12 @@ class SpeechAdapterTask(LegacyFairseqTask):
                     if k not in agg_logging_output:
                         agg_logging_output[k] = 0
                     agg_logging_output[k] += logging_output[k]
-                    # continue
-                # agg_logging_output[k] += logging_output[k]
-                # agg_logging_output[task_name] += logging_output[k]
-            agg_logging_output['model'] = logging_output
+            
+            agg_logging_output.update(logging_output)
+            agg_sample_size = agg_logging_output['sample_size']
+        
 
         forward_backward(model, sample)
-
         agg_logging_output["loss"] = agg_loss
 
         return agg_loss, agg_sample_size, agg_logging_output
@@ -211,15 +142,13 @@ class SpeechAdapterTask(LegacyFairseqTask):
     def valid_step(self, sample, model, criterion):
         model.eval()
         with torch.no_grad():
-            from collections import defaultdict
-
-            agg_loss, agg_sample_size, agg_logging_output = 0.0, 1.0, defaultdict(float)
+            agg_loss, agg_sample_size, agg_logging_output = 0.0, 1.0, {}
             agg_logging_output['sample_size'] = 1
             loss, sample_size, logging_output = criterion(model, sample)
             loss = loss / sample_size
             # agg_loss += loss.data.item() if isinstance(loss, torch.Tensor) else loss
             agg_loss += loss.item() if isinstance(loss, torch.Tensor) else loss
-            agg_logging_output['model'] = logging_output
+            agg_logging_output.update(logging_output)
             agg_logging_output["loss"] = agg_loss
         return agg_loss, agg_sample_size, agg_logging_output
 
@@ -232,17 +161,5 @@ class SpeechAdapterTask(LegacyFairseqTask):
         return None
 
     def build_model(self, args):
-        try:
-            args.input_feat_per_channel = self.config.input_feat_per_channel
-            args.input_channels = self.config.input_channels
-        except Exception as e:
-            args.input_feat_per_channel = 80
-            args.input_channels = 1
-            logger.info(f"Cannot set input_feat_per_channel, input_channels, since: ")
-            logger.warn(e)
-            logger.info(f"Set to: {args.input_feat_per_channel} and {args.input_channels}")
-
-        args.speech_odim = args.input_feat_per_channel * args.input_channels
-
         args.sample_rate = self.args.sample_rate
-        return super(SpeechAdapterTask, self).build_model(args)
+        return super(QformerSpeechTaskTokenized, self).build_model(args)

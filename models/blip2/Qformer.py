@@ -1213,3 +1213,157 @@ class BertForMaskedLM(BertPreTrainedModel):
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
+
+
+
+
+# class BertForCTC(BertPreTrainedModel):
+
+#     _keys_to_ignore_on_load_unexpected = [r"pooler"]
+#     _keys_to_ignore_on_load_missing = [r"position_ids", r"predictions.decoder.bias"]
+
+#     def __init__(self, config):
+#         super().__init__(config)
+
+#         self.bert = BertModel(config, add_pooling_layer=False)
+#         self.dropout = nn.Dropout(config.final_dropout)
+        
+#         if config.vocab_size is None:
+#             raise ValueError(
+#                 f"You are trying to instantiate {self.__class__} with a configuration that "
+#                 "does not define the vocabulary size of the language model head. Please "
+#                 "instantiate the model as follows: `HubertForCTC.from_pretrained(..., vocab_size=vocab_size)`. "
+#                 "or define `vocab_size` of your model's configuration."
+#             )
+#         output_hidden_size = (
+#             config.output_hidden_size if hasattr(config, "add_adapter") and config.add_adapter else config.hidden_size
+#         )
+#         self.lm_head = nn.Linear(output_hidden_size, config.vocab_size)
+
+#         # Initialize weights and apply final processing
+#         self.post_init()
+
+
+#     def forward(
+#         self,
+#         input_ids=None,
+#         attention_mask=None,
+#         position_ids=None,
+#         head_mask=None,
+#         query_embeds=None,
+#         encoder_hidden_states=None,
+#         encoder_attention_mask=None,
+#         labels=None,
+#         past_key_values=None,
+#         use_cache=True,
+#         output_attentions=None,
+#         output_hidden_states=None,
+#         return_dict=None,
+#         return_logits=False,
+#         is_decoder=True,
+#         reduction="mean",
+#     ):
+#         return_dict = (
+#             return_dict if return_dict is not None else self.config.use_return_dict
+#         )
+#         if labels is not None:
+#             use_cache = False
+#         if past_key_values is not None:
+#             query_embeds = None
+
+#         outputs = self.bert(
+#             input_ids,
+#             attention_mask=attention_mask,
+#             position_ids=position_ids,
+#             head_mask=head_mask,
+#             query_embeds=query_embeds,
+#             encoder_hidden_states=encoder_hidden_states,
+#             encoder_attention_mask=encoder_attention_mask,
+#             past_key_values=past_key_values,
+#             use_cache=use_cache,
+#             output_attentions=output_attentions,
+#             output_hidden_states=output_hidden_states,
+#             return_dict=return_dict,
+#             is_decoder=is_decoder,
+#         )
+
+#         hidden_states = outputs[0]
+#         hidden_states = self.dropuout(hidden_states)
+
+#         logits = self.lm_head(hidden_states)
+#         loss = None
+#         if labels is not None:
+#             if labels.max() >= self.config.vocab_size:
+#                 raise ValueError(f"Label values must be <= vocab_size: {self.config.vocab_size}")
+
+#             # retrieve loss input_lengths from attention_mask
+#             attention_mask = (
+#                 attention_mask if attention_mask is not None else torch.ones_like(input_values, dtype=torch.long)
+#             )
+#             input_lengths = labels >= 0
+
+#             # assuming that padded tokens are filled with -100
+#             # when not being attended to
+#             labels_mask = labels >= 0
+#             target_lengths = labels_mask.sum(-1)
+#             flattened_targets = labels.masked_select(labels_mask)
+
+#             # ctc_loss doesn't support fp16
+#             log_probs = nn.functional.log_softmax(logits, dim=-1, dtype=torch.float32).transpose(0, 1)
+
+#             with torch.backends.cudnn.flags(enabled=False):
+#                 loss = nn.functional.ctc_loss(
+#                     log_probs,
+#                     flattened_targets,
+#                     input_lengths,
+#                     target_lengths,
+#                     blank=self.config.pad_token_id,
+#                     reduction=self.config.ctc_loss_reduction,
+#                     zero_infinity=self.config.ctc_zero_infinity,
+#                 )
+
+#         if not return_dict:
+#             output = (prediction_scores,) + outputs[2:]
+#             return ((lm_loss,) + output) if lm_loss is not None else output
+
+#         return CausalLMOutputWithCrossAttentions(
+#             loss=lm_loss,
+#             logits=prediction_scores,
+#             past_key_values=outputs.past_key_values,
+#             hidden_states=outputs.hidden_states,
+#             attentions=outputs.attentions,
+#             cross_attentions=outputs.cross_attentions,
+#         )
+
+#     def prepare_inputs_for_generation(
+#         self, input_ids, query_embeds, past=None, attention_mask=None, **model_kwargs
+#     ):
+#         # if model is used as a decoder in encoder-decoder model, the decoder attention mask is created on the fly
+#         if attention_mask is None:
+#             attention_mask = input_ids.new_ones(input_ids.shape)
+#         query_mask = input_ids.new_ones(query_embeds.shape[:-1])
+#         attention_mask = torch.cat([query_mask, attention_mask], dim=-1)
+
+#         # cut decoder_input_ids if past is used
+#         if past is not None:
+#             input_ids = input_ids[:, -1:]
+
+#         return {
+#             "input_ids": input_ids,
+#             "query_embeds": query_embeds,
+#             "attention_mask": attention_mask,
+#             "past_key_values": past,
+#             "encoder_hidden_states": model_kwargs.get("encoder_hidden_states", None),
+#             "encoder_attention_mask": model_kwargs.get("encoder_attention_mask", None),
+#             "is_decoder": True,
+#         }
+
+#     def _reorder_cache(self, past, beam_idx):
+#         reordered_past = ()
+#         for layer_past in past:
+#             reordered_past += (
+#                 tuple(
+#                     past_state.index_select(0, beam_idx) for past_state in layer_past
+#                 ),
+#             )
+#         return reordered_past

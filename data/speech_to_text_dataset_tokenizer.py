@@ -20,35 +20,10 @@ import torch.nn.functional as F
 from fairseq.data import data_utils, Dictionary
 from fairseq.data.fairseq_dataset import FairseqDataset
 
+from ..models.speechtokenizer.model import SpeechTokenizer
+import pandas as pd
+
 logger = logging.getLogger(__name__)
-
-
-def load_audio(manifest_path, max_keep, min_keep):
-    n_long, n_short = 0, 0
-    names, inds, sizes = [], [], []
-    with open(manifest_path) as f:
-        root = f.readline().strip()
-        for ind, line in enumerate(f):
-            items = line.strip().split("\t")
-            assert len(items) >= 2, line
-            sz = int(items[1])
-            if min_keep is not None and sz < min_keep:
-                n_short += 1
-            elif max_keep is not None and sz > max_keep:
-                n_long += 1
-            else:
-                names.append(items[0])
-                inds.append(ind)
-                sizes.append(sz)
-    tot = ind + 1
-    logger.info(
-        (
-            f"max_keep={max_keep}, min_keep={min_keep}, "
-            f"loaded {len(names)}, skipped {n_short} short and {n_long} long, "
-            f"longest-loaded={max(sizes)}, shortest-loaded={min(sizes)}"
-        )
-    )
-    return root, names, inds, tot, sizes
 
 
 def load_label(label_path, inds, tot):
@@ -72,7 +47,7 @@ def load_label_offset(label_path, inds, tot):
     return offsets
 
 
-class SpeechToTextDataset(FairseqDataset):
+class SpeechToTextDatasetTokenizer(FairseqDataset):
     def __init__(
         self,
         manifest_path: str,
@@ -83,12 +58,14 @@ class SpeechToTextDataset(FairseqDataset):
         shuffle: bool = True,
         normalize: bool = False,
         store_labels: bool = True,
+        speechtokenizer_configpath=None,
+        speechtokenizer_ckptpath=None
     ):
-        self.audio_root, self.audio_names, inds, tot, self.wav_sizes = load_audio(
-            manifest_path, max_keep_sample_size, min_keep_sample_size
-        )
+        self.speechcodes = pd.read_csv(manifest_path, sep='\t')[['speechcodes_str']]
         self.sample_rate = sample_rate
         self.shuffle = shuffle
+        inds = list(range(len(self.speechcodes)))
+        tot = len(inds)
 
         self.num_labels = len(label_paths)
         self.store_labels = store_labels
@@ -104,12 +81,6 @@ class SpeechToTextDataset(FairseqDataset):
         logger.info(
             f"normalize={normalize}"
         )
-
-    def get_audio(self, index):
-        wav_path = os.path.join(self.audio_root, self.audio_names[index])
-        wav, cur_sample_rate = torchaudio.load(wav_path)
-        # wav = self.postprocess(wav, cur_sample_rate)
-        return wav.squeeze()
 
     def get_label(self, index, label_idx):
         if self.store_labels:
@@ -128,12 +99,12 @@ class SpeechToTextDataset(FairseqDataset):
         return [self.get_label(index, i) for i in range(self.num_labels)]
 
     def __getitem__(self, index):
-        wav = self.get_audio(index)
+        wav = list(map(lambda x: int(x), self.speechcodes.iloc[index].to_dict()['speechcodes_str'].split(' ')))
         labels = self.get_labels(index)
         return {"id": index, "source": wav, "label_list": labels, "speech_id": index}
 
     def __len__(self):
-        return len(self.wav_sizes)
+        return len(self.speechcodes)
 
     def collater(self, samples):
         samples = [s for s in samples if s["source"] is not None]
@@ -155,7 +126,7 @@ class SpeechToTextDataset(FairseqDataset):
         lengths_list, ntokens_list = self.collater_label(targets_by_label)
 
         net_input = {
-            "source": collated_audios, 
+            "source": torch.Tensor(collated_audios).to(int), 
             "padding_mask": padding_mask,
             "task_name": "s2t",
             "target": targets_by_label,
@@ -172,16 +143,15 @@ class SpeechToTextDataset(FairseqDataset):
         return batch
 
     def collater_audio(self, audios, audio_size):
-        collated_audios = audios[0].new_zeros(len(audios), audio_size)
-        padding_mask = (
-            torch.BoolTensor(collated_audios.shape).fill_(False)
-        )
+        collated_audios = np.zeros((len(audios), audio_size))
+        padding_mask = torch.BoolTensor(*collated_audios.shape).fill_(False)
         for i, audio in enumerate(audios):
+            audio = torch.Tensor(audio)
             diff = len(audio) - audio_size
             if diff == 0:
                 collated_audios[i] = audio
             elif diff < 0:
-                collated_audios[i] = torch.cat([audio, audio.new_full((-diff,), 0.0)])
+                collated_audios[i] = torch.cat([audio, audio.new_full((-diff,), 0)])
                 padding_mask[i, diff:] = True
             else:
                 raise Exception("Diff should not be larger than 0")
@@ -205,11 +175,11 @@ class SpeechToTextDataset(FairseqDataset):
         return self.size(index)
 
     def size(self, index):
-        return self.wav_sizes[index]
+        return len(self.speechcodes.iloc[index].to_dict()['speechcodes_str'].split(' '))
 
     @property
     def sizes(self):
-        return np.array(self.wav_sizes)
+        return np.array(self.speechcodes['speechcodes_str'].apply(lambda x: len(x)))
 
     def ordered_indices(self):
         if self.shuffle:
@@ -217,7 +187,7 @@ class SpeechToTextDataset(FairseqDataset):
         else:
             order = [np.arange(len(self))]
 
-        order.append(self.wav_sizes)
+        order.append(self.speechcodes['speechcodes_str'].apply(lambda x: len(x)))
         return np.lexsort(order)[::-1]
 
     def postprocess(self, wav, cur_sample_rate):

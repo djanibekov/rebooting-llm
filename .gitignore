@@ -5,3 +5,8 @@ __pycache__
 
 _data
 _savedir
+_checkpoints*/
+logs/
+
+checkpoints*
+wandb

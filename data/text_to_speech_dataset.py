@@ -72,7 +72,7 @@ def load_label_offset(label_path, inds, tot):
     return offsets
 
 
-class SpeechToTextDataset(FairseqDataset):
+class TextToSpeechDataset(FairseqDataset):
     def __init__(
         self,
         manifest_path: str,
@@ -83,12 +83,16 @@ class SpeechToTextDataset(FairseqDataset):
         shuffle: bool = True,
         normalize: bool = False,
         store_labels: bool = True,
+        tgt_dict: Optional[Dictionary] = None,
+        tokenizer = None,
     ):
         self.audio_root, self.audio_names, inds, tot, self.wav_sizes = load_audio(
             manifest_path, max_keep_sample_size, min_keep_sample_size
         )
         self.sample_rate = sample_rate
         self.shuffle = shuffle
+        self.tgt_dict = tgt_dict
+        self.tokenizer = tokenizer
 
         self.num_labels = len(label_paths)
         self.store_labels = store_labels
@@ -107,8 +111,7 @@ class SpeechToTextDataset(FairseqDataset):
 
     def get_audio(self, index):
         wav_path = os.path.join(self.audio_root, self.audio_names[index])
-        wav, cur_sample_rate = torchaudio.load(wav_path)
-        # wav = self.postprocess(wav, cur_sample_rate)
+        wav, sr = torchaudio.load(wav_path)
         return wav.squeeze()
 
     def get_label(self, index, label_idx):
@@ -120,8 +123,9 @@ class SpeechToTextDataset(FairseqDataset):
                 f.seek(offset_s)
                 label = f.read(offset_e - offset_s)
 
-        # if self.label_processors is not None:
-        #     label = self.label_processors[label_idx](label)
+        if self.tokenizer is not None:
+            label = self.tokenizer.encode(label)
+
         return label
 
     def get_labels(self, index):
@@ -130,7 +134,7 @@ class SpeechToTextDataset(FairseqDataset):
     def __getitem__(self, index):
         wav = self.get_audio(index)
         labels = self.get_labels(index)
-        return {"id": index, "source": wav, "label_list": labels, "speech_id": index}
+        return {"id": index, "source": wav, "label_list": labels}
 
     def __len__(self):
         return len(self.wav_sizes)
@@ -141,7 +145,6 @@ class SpeechToTextDataset(FairseqDataset):
             return {}
 
         audios = [s["source"] for s in samples]
-        speech_ids = [s["speech_id"] for s in samples]
         audio_sizes = [len(s) for s in audios]
 
         audio_size = max(audio_sizes)
@@ -154,17 +157,41 @@ class SpeechToTextDataset(FairseqDataset):
         ]
         lengths_list, ntokens_list = self.collater_label(targets_by_label)
 
+        # decoder_label = [
+        #     torch.cat((targets_list[0][i, :lengths_list[0][i]], torch.tensor([self.tgt_dict.eos()])), 0).long()
+        #     for i in range(targets_list[0].size(0))
+        # ]
+
+        # decoder_target = data_utils.collate_tokens(
+        #     decoder_label,
+        #     self.tgt_dict.pad(),
+        #     self.tgt_dict.eos(),
+        #     left_pad=False,
+        #     move_eos_to_beginning=False,
+        # )
+        # decoder_target_lengths = torch.tensor(
+        #     [x.size(0) for x in decoder_label], dtype=torch.long
+        # )
+        # prev_output_tokens = data_utils.collate_tokens(
+        #     decoder_label,
+        #     self.tgt_dict.pad(),
+        #     self.tgt_dict.eos(),
+        #     left_pad=False,
+        #     move_eos_to_beginning=True,
+        # )
+        # breakpoint()
         net_input = {
             "source": collated_audios, 
             "padding_mask": padding_mask,
+            # "prev_output_tokens": prev_output_tokens,
             "task_name": "s2t",
             "target": targets_by_label,
-            "speech_id": torch.Tensor(speech_ids)
         }
         batch = {
             "id": torch.LongTensor([s["id"] for s in samples]),
             "net_input": net_input,
             "target": targets_by_label,
+            # "target_lengths": decoder_target_lengths,
             "task_name": "s2t",
             "ntokens": ntokens_list[0]
         }
@@ -190,6 +217,7 @@ class SpeechToTextDataset(FairseqDataset):
     def collater_seq_label(self, targets, pad):
         lengths = torch.LongTensor([len(t) for t in targets])
         ntokens = lengths.sum().item()
+        # targets = data_utils.collate_tokens(targets, pad_idx=pad, left_pad=False)
         return lengths, ntokens
 
     def collater_label(self, targets_by_label):

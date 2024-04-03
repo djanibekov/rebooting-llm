@@ -51,11 +51,12 @@ logger = logging.get_logger(__name__)
 class BertEmbeddings(nn.Module):
     """Construct the embeddings from word and position embeddings."""
 
-    def __init__(self, config):
+    def __init__(self, config, speech_embeddings=None):
         super().__init__()
         self.word_embeddings = nn.Embedding(
             config.vocab_size, config.hidden_size, padding_idx=config.pad_token_id
         )
+        self.speech_embeddings = speech_embeddings
         self.position_embeddings = nn.Embedding(
             config.max_position_embeddings, config.hidden_size
         )
@@ -81,7 +82,10 @@ class BertEmbeddings(nn.Module):
         position_ids=None,
         query_embeds=None,
         past_key_values_length=0,
+        output_type='text'
     ):
+        assert speech_embeddings is None and output_type == 'text'
+
         if input_ids is not None:
             seq_length = input_ids.size()[1]
         else:
@@ -93,7 +97,11 @@ class BertEmbeddings(nn.Module):
             ].clone()
 
         if input_ids is not None:
-            embeddings = self.word_embeddings(input_ids)
+            if output_type == 'text':
+                embeddings = self.word_embeddings(input_ids)
+            else:
+                embeddings = self.speech_embeddings(input_ids)
+
             if self.position_embedding_type == "absolute":
                 position_embeddings = self.position_embeddings(position_ids)
                 embeddings = embeddings + position_embeddings
@@ -684,11 +692,14 @@ class BertModel(BertPreTrainedModel):
     input to the forward pass.
     """
 
-    def __init__(self, config, add_pooling_layer=False):
+    def __init__(self, config, add_pooling_layer=False, speech_embeddings=None):
         super().__init__(config)
         self.config = config
-        self.embeddings = BertEmbeddings(config)
+
+        self.embeddings = BertEmbeddings(config, speech_embeddings)
+
         self.encoder = BertEncoder(config)
+
         self.pooler = BertPooler(config) if add_pooling_layer else None
 
         self.init_weights()
@@ -813,6 +824,7 @@ class BertModel(BertPreTrainedModel):
         output_hidden_states=None,
         return_dict=None,
         is_decoder=False,
+        output_type='text'
     ):
         r"""
         encoder_hidden_states  (:obj:`torch.FloatTensor` of shape :obj:`(batch_size, sequence_length, hidden_size)`, `optional`):
@@ -867,6 +879,7 @@ class BertModel(BertPreTrainedModel):
             position_ids=position_ids,
             query_embeds=query_embeds,
             past_key_values_length=past_key_values_length,
+            output_type=output_type
         )
 
         input_shape = embedding_output.size()[:-1]
@@ -967,10 +980,10 @@ class BertLMHeadModel(BertPreTrainedModel):
     _keys_to_ignore_on_load_unexpected = [r"pooler"]
     _keys_to_ignore_on_load_missing = [r"position_ids", r"predictions.decoder.bias"]
 
-    def __init__(self, config):
+    def __init__(self, config, speech_embeddings=None):
         super().__init__(config)
 
-        self.bert = BertModel(config, add_pooling_layer=False)
+        self.bert = BertModel(config, add_pooling_layer=False, speech_embeddings=speech_embeddings)
         self.cls = BertOnlyMLMHead(config)
 
         self.init_weights()
@@ -999,6 +1012,7 @@ class BertLMHeadModel(BertPreTrainedModel):
         return_logits=False,
         is_decoder=True,
         reduction="mean",
+        output_type='text'
     ):
         r"""
         encoder_hidden_states  (:obj:`torch.FloatTensor` of shape :obj:`(batch_size, sequence_length, hidden_size)`, `optional`):
@@ -1054,6 +1068,7 @@ class BertLMHeadModel(BertPreTrainedModel):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
             is_decoder=is_decoder,
+            output_type=output_type
         )
 
         sequence_output = outputs[0]
@@ -1070,11 +1085,10 @@ class BertLMHeadModel(BertPreTrainedModel):
             # we are doing next-token prediction; shift prediction scores and input ids by one
             shifted_prediction_scores = prediction_scores[:, :-1, :].contiguous()
             labels = labels[:, 1:].contiguous()
+            # breakpoint()
+            
             loss_fct = CrossEntropyLoss(reduction=reduction, label_smoothing=0.1)
-            lm_loss = loss_fct(
-                shifted_prediction_scores.view(-1, self.config.vocab_size),
-                labels.view(-1),
-            )
+            lm_loss = loss_fct(shifted_prediction_scores.view(-1, self.config.vocab_size),labels.view(-1),)
             if reduction == "none":
                 lm_loss = lm_loss.view(prediction_scores.size(0), -1).sum(1)
 
@@ -1130,10 +1144,10 @@ class BertForMaskedLM(BertPreTrainedModel):
     _keys_to_ignore_on_load_unexpected = [r"pooler"]
     _keys_to_ignore_on_load_missing = [r"position_ids", r"predictions.decoder.bias"]
 
-    def __init__(self, config):
+    def __init__(self, config, speech_embeddings=None):
         super().__init__(config)
 
-        self.bert = BertModel(config, add_pooling_layer=False)
+        self.bert = BertModel(config, add_pooling_layer=False, speech_embeddings=speech_embeddings)
         self.cls = BertOnlyMLMHead(config)
 
         self.init_weights()
@@ -1159,6 +1173,7 @@ class BertForMaskedLM(BertPreTrainedModel):
         return_dict=None,
         return_logits=False,
         is_decoder=False,
+        output_type='text'
     ):
         r"""
         labels (:obj:`torch.LongTensor` of shape :obj:`(batch_size, sequence_length)`, `optional`):
@@ -1183,6 +1198,7 @@ class BertForMaskedLM(BertPreTrainedModel):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
             is_decoder=is_decoder,
+            output_type=output_type
         )
 
         if query_embeds is not None:

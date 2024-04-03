@@ -1,1 +1,1 @@
-# from .blip2.blip2_qformer import *  # noqa
+from .blip2 import *

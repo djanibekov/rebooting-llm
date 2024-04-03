@@ -5,7 +5,7 @@ Created on Wed Aug 30 15:47:55 2023
 """
 
 from .modules.seanet import SEANetEncoder, SEANetDecoder
-from .quantization  import ResidualVectorQuantizer
+from .quantization import ResidualVectorQuantizer
 import torch.nn as nn
 from einops import rearrange
 import torch
@@ -72,7 +72,7 @@ class SpeechTokenizer(nn.Module):
         with open(config_path) as f:
             cfg = json.load(f)
         model = cls(cfg)
-        params = torch.load(ckpt_path, map_location='cpu')
+        params = torch.load(ckpt_path, map_location='cuda' if torch.cuda.is_available() else 'cpu')
         model.load_state_dict(params)
         return model
     
@@ -131,7 +131,7 @@ class SpeechTokenizer(nn.Module):
         e = self.encoder(x)
         layers = layers if layers else list(range(self.n_q))
         quantized, codes, commit_loss, quantized_list = self.quantizer(e, layers=layers)
-        return quantized_list
+        return quantized_list, codes
     
     def encode(self, 
                x: torch.tensor, 

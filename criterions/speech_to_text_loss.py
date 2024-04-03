@@ -24,7 +24,6 @@ class SpeechtoTextLoss(FairseqCriterion):
 
         sample_size = len(sample["target"])
         loss = output['loss']
-        # breakpoint()
 
         logging_output = {
             "loss": output['loss'].item(),
@@ -32,10 +31,7 @@ class SpeechtoTextLoss(FairseqCriterion):
             "nsentences": len(sample["target"][0]),
             "sample_size": sample_size,
         }
-        print(logging_output)
 
-        if torch.isinf(loss):
-            raise NotImplemented
 
         return loss, sample_size, logging_output
 
@@ -69,77 +65,6 @@ class SpeechtoTextLoss(FairseqCriterion):
             "loss", loss_sum / sample_size / math.log(2), sample_size, round=3
         )
 
-        # metrics.log_scalar(
-        #     "ctc_loss", ctc_loss_sum / sample_size / math.log(2), ntokens, 2, round=3
-        # )
-        # metrics.log_scalar(
-        #     "ce_loss", ce_loss_sum / ntokens, ntokens, 2, round=3
-        # )
-        # metrics.log_scalar(
-        #     "nll_loss", nll_loss_sum / ntokens / math.log(2), ntokens, 2, round=3
-        # )
-        # metrics.log_derived(
-        #     "ppl", lambda meters: utils.get_perplexity(meters["nll_loss"].avg, 2)
-        # )
-        
-        # total = utils.item(sum(log.get("total", 0) for log in logging_outputs))
-        # if total > 0:
-        #     metrics.log_scalar("total", total)
-        #     n_correct = utils.item(
-        #         sum(log.get("n_correct", 0) for log in logging_outputs)
-        #     )
-        #     metrics.log_scalar("n_correct", n_correct)
-        #     metrics.log_derived(
-        #         "accuracy",
-        #         lambda meters: round(
-        #             meters["n_correct"].sum * 100.0 / meters["total"].sum, 3
-        #         )
-        #         if meters["total"].sum > 0
-        #         else float("nan"),
-        #         2
-        #     )
-
         metrics.log_scalar("ntokens", ntokens)
         metrics.log_scalar("nsentences", nsentences)
-        # if sample_size != ntokens:
-        #     metrics.log_scalar(
-        #         "nll_loss", loss_sum / ntokens / math.log(2), ntokens, round=3
-        #     )
-
-        # c_errors = sum(log.get("c_errors", 0) for log in logging_outputs)
-        # metrics.log_scalar("_c_errors", c_errors)
-        # c_total = sum(log.get("c_total", 0) for log in logging_outputs)
-        # metrics.log_scalar("_c_total", c_total)
-        # w_errors = sum(log.get("w_errors", 0) for log in logging_outputs)
-        # metrics.log_scalar("_w_errors", w_errors)
-        # wv_errors = sum(log.get("wv_errors", 0) for log in logging_outputs)
-        # metrics.log_scalar("_wv_errors", wv_errors)
-        # w_total = sum(log.get("w_total", 0) for log in logging_outputs)
-        # metrics.log_scalar("_w_total", w_total)
-
-        # if c_total > 0:
-        #     metrics.log_derived(
-        #         "uer",
-        #         lambda meters: safe_round(
-        #             meters["_c_errors"].sum * 100.0 / meters["_c_total"].sum, 3
-        #         )
-        #         if meters["_c_total"].sum > 0
-        #         else float("nan"),
-        #     )
-        # if w_total > 0:
-        #     metrics.log_derived(
-        #         "wer",
-        #         lambda meters: safe_round(
-        #             meters["_w_errors"].sum * 100.0 / meters["_w_total"].sum, 3
-        #         )
-        #         if meters["_w_total"].sum > 0
-        #         else float("nan"),
-        #     )
-        #     metrics.log_derived(
-        #         "raw_wer",
-        #         lambda meters: safe_round(
-        #             meters["_wv_errors"].sum * 100.0 / meters["_w_total"].sum, 3
-        #         )
-        #         if meters["_w_total"].sum > 0
-        #         else float("nan"),
-        #     )
+    

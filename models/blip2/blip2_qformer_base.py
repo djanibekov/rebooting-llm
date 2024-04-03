@@ -12,6 +12,7 @@ import torch.distributed as dist
 import torch.nn as nn
 from torch.cuda.amp import autocast as autocast
 from torch.nn import functional as F
+from torch.nn import CrossEntropyLoss
 
 from .blip2 import (
     Blip2Base,
@@ -21,7 +22,7 @@ from .blip2 import (
 from .blip_outputs import BlipOutput, BlipOutputFeatures
 
 from fairseq.models import register_model, register_model_architecture
-from models.speechtokenizer import SpeechTokenizer
+from ..speechtokenizer.model import SpeechTokenizer
 
 
 from lavis.models.base_model import all_gather_with_grad, concat_all_gather
@@ -41,24 +42,22 @@ class LayerNorm(nn.LayerNorm):
         ret = super().forward(x)
         return ret.type(orig_type)
 
-@register_model("speech_qformer")
-class Blip2Qformer(Blip2Base):
+@register_model("speech_qformer_base")
+class Blip2QformerBase(Blip2Base):
 
     @classmethod
     def build_model(cls, args, task):
         """Build a new model instance."""
-
-        # make sure all arguments are present in older models
         base_architecture(args)
         speech_encoder, config = cls.build_speech_model({
-            'speech_model_file_path': '/l/users/amirbek.djanibekov/master-thesis/models/SpeechTokenizer/huggingface/SpeechTokenizer/speechtokenizer_hubert_avg/SpeechTokenizer.pt',
-            'speech_model_config_path': '/l/users/amirbek.djanibekov/master-thesis/models/SpeechTokenizer/huggingface/SpeechTokenizer/speechtokenizer_hubert_avg/config.json',
-            'freeze_vit': True
+            'speech_model_file_path': args.speechtokenizer_ckptpath,
+            'speech_model_config_path': args.speechtokenizer_configpath,
+            'freeze_enc': True
         })      
         Qformer, query_tokens, tokenizer = cls.build_qformer({
             'codebook_size': config['codebook_size'],
-            'cross_attention_freq': 2,
-            'num_query_token': 32
+            'cross_attention_freq': args.cross_attention_freq,
+            'num_query_token': args.num_query_token
         })
 
         return cls(
@@ -69,6 +68,7 @@ class Blip2Qformer(Blip2Base):
             tokenizer,
             config
         )
+
     @classmethod
     def build_speech_model(cls, args, dictionary=None, embed_tokens=None):
         speech_encoder = SpeechTokenizer.load_from_checkpoint(
@@ -80,11 +80,10 @@ class Blip2Qformer(Blip2Base):
         with open(args['speech_model_config_path']) as config_file:
             config = json.load(config_file)
 
-        if args['freeze_vit']:
+        if args['freeze_enc']:
             for name, param in speech_encoder.named_parameters():
                 param.requires_grad = False
             speech_encoder.eval()
-
 
         return speech_encoder, config
     
@@ -98,6 +97,14 @@ class Blip2Qformer(Blip2Base):
 
         return Qformer, query_tokens, tokenizer
 
+    @staticmethod
+    def add_args(parser):
+        parser.add_argument("--cross-attention-freq", type=int)
+        parser.add_argument("--num-query-token", type=int)
+        parser.add_argument("--speech-model-config-path", type=str)
+        parser.add_argument("--speech-model-file-path", type=str)
+        parser.add_argument("--qformer-dim", type=str)
+       
 
     def __init__(
         self,
@@ -109,10 +116,8 @@ class Blip2Qformer(Blip2Base):
         speech_config,
         drop_path_rate=0,
         use_grad_checkpoint=False,
-        vit_precision="fp16",
         embed_dim=256,
-        max_txt_len=64,
-        droupout_rate=0.1
+        max_txt_len=100,
 
     ):
         super().__init__()
@@ -124,9 +129,6 @@ class Blip2Qformer(Blip2Base):
 
         self.ln_speech = LayerNorm(speech_config['codebook_size'])
 
-        # self.visual_encoder, self.ln_vision = self.init_vision_encoder(
-        #     vit_model, img_size, drop_path_rate, use_grad_checkpoint, vit_precision
-        # )
         state_dict = self.Qformer.state_dict()
         for name, param in self.Qformer.named_parameters():
             if "_query" in name:
@@ -137,37 +139,20 @@ class Blip2Qformer(Blip2Base):
         self.text_proj = nn.Linear(self.Qformer.config.hidden_size, embed_dim)
 
         self.itm_head = nn.Linear(self.Qformer.config.hidden_size, 2)
-
         self.temp = nn.Parameter(0.07 * torch.ones([]))
 
-        self.max_txt_len = max_txt_len
-        self.blank_symbol = "<ctc_blank>"
-
-        self.ctc_proj = nn.Linear(
-                self.Qformer.config.hidden_size,
-                len(self.tokenizer),
-                bias=False,
-            )
-        self.dropout_module = FairseqDropout(
-            droupout_rate, module_name=self.__class__.__name__
-        )
+        self.max_txt_len = args.num_query_token
+        self.speechtokenizer_padding_idx = 931
+    
 
     def forward(self, samples):
         speech = samples["source"]
-        text = samples["target"]
+        text = samples["target"][0]
         
-        codes = self.speech_encoder.encode(speech.unsqueeze(1), 1) # codes: (n_q, B, T)
-        if torch.unique(codes).numel() < 0.20 * codes.shape[-1]:
-            logging.info('Non-unique tensor is detected')
-            breakpoint()
-            return None
+        speech_embeds, codes = self.speech_encoder.forward_feature(speech.unsqueeze(1), [0])
+        speech_embeds = self.ln_speech(speech_embeds[0].transpose(1, 2))
 
-        speech_embeds = self.speech_encoder.quantizer.decode(codes).transpose(1, 2)
-        speech_embeds = self.ln_speech(speech_embeds)
-        speech_atts = torch.ones(speech_embeds.size()[:-1], dtype=torch.long).to(
-            speech.device
-        )
-
+        speech_atts = codes[0] != self.speechtokenizer_padding_idx
         query_tokens = self.query_tokens.expand(speech_embeds.shape[0], -1, -1)
 
         query_output = self.Qformer.bert(
@@ -181,89 +166,92 @@ class Blip2Qformer(Blip2Base):
         speech_feats = F.normalize(
             self.speech_proj(query_output.last_hidden_state), dim=-1
         )
-        # breakpoint()
 
-        text_tokens = self.tokenizer(text[0], padding="max_length", truncation=True, max_length=self.max_txt_len, return_tensors="pt",).to(speech.device)
+        text_tokens = self.tokenizer(
+            text, 
+            padding="max_length", 
+            truncation=True, 
+            max_length=self.max_txt_len, 
+            return_tensors="pt",
+        ).to(speech.device)
+
         text_output = self.Qformer.bert(
             text_tokens.input_ids,
             attention_mask=text_tokens.attention_mask,
             return_dict=True,
         )
         text_feat = F.normalize(self.text_proj(text_output.last_hidden_state[:, 0, :]), dim=-1)
+        # breakpoint()
 
-        ###============== Image-text Contrastive ===================###
-        speech_feats_all = speech_feats
-        text_feat_all = text_feat  # [batch_size*num_gpu, embed_dim]
+        ###============== Speech-text Contrastive ===================###
+        speech_feats_all = concat_all_gather(speech_feats)
+        text_feat_all = concat_all_gather(text_feat)  # [batch_size*num_gpu, embed_dim]
 
-        sim_q2t = torch.matmul(
-            speech_feats.unsqueeze(1), text_feat_all.unsqueeze(-1)
-        ).squeeze()
+        sim_q2t = torch.matmul(speech_feats.unsqueeze(1), text_feat_all.unsqueeze(-1)).squeeze()
         # [batch_size, batch_size*num_gpu, num_query_tokens]
 
-        # image-text similarity: aggregate across all query tokens
-        sim_i2t, _ = sim_q2t.max(-1)
-        sim_i2t = sim_i2t / self.temp
+        # speech-text similarity: aggregate across all query tokens
+        sim_s2t, _ = sim_q2t.max(-1)
+        sim_s2t = sim_s2t / self.temp
 
         # text-query similarity: [batch_size, batch_size*num_gpu, num_query_tokens]
-        sim_t2q = torch.matmul(
-            text_feat.unsqueeze(1).unsqueeze(1), speech_feats_all.permute(0, 2, 1)
-        ).squeeze()
+        sim_t2q = torch.matmul(text_feat.unsqueeze(1).unsqueeze(1), speech_feats_all.permute(0, 2, 1)).squeeze()
 
-        # text-image similarity: aggregate across all query tokens
-        sim_t2i, _ = sim_t2q.max(-1)
-        sim_t2i = sim_t2i / self.temp  # [batch_size, batch_size*num_gpu]
+        # text-speech similarity: aggregate across all query tokens
+        sim_t2s, _ = sim_t2q.max(-1)
+        sim_t2s = sim_t2s / self.temp  # [batch_size, batch_size*num_gpu]
         
         # rank = dist.get_rank()
-        rank = 0
+        rank = dist.get_rank()
         bs = speech.size(0)
         targets = torch.linspace(rank * bs, rank * bs + bs - 1, bs, dtype=int).to(
             speech.device
         )
 
-        # if "image_id" in samples.keys(): #coco retrieval finetuning
-        #     image_ids = samples["image_id"].view(-1,1)
-        #     image_ids_all = concat_all_gather(image_ids)
-        #     pos_idx = torch.eq(image_ids, image_ids_all.t()).float()       
-        #     sim_targets = pos_idx / pos_idx.sum(1,keepdim=True)   
-        #     sim_targets = 0.9 * sim_targets + 0.1 * torch.ones_like(sim_targets) / sim_targets.size(1)
 
-        #     loss_t2i = -torch.sum(F.log_softmax(sim_t2i, dim=1)*sim_targets,dim=1).mean()
-        #     loss_i2t = -torch.sum(F.log_softmax(sim_i2t, dim=1)*sim_targets,dim=1).mean()     
-        #     loss_itc = (loss_t2i+loss_i2t)/2  
-        # else:                     
-        loss_itc = (
-            F.cross_entropy(sim_i2t, targets, label_smoothing=0.1)
-            + F.cross_entropy(sim_t2i, targets, label_smoothing=0.1)
-        ) / 2
+        speech_ids = samples["speech_id"].view(-1,1)
+        speech_ids_all = concat_all_gather(speech_ids)
+        pos_idx = torch.eq(speech_ids, speech_ids_all.t()).float()       
+        sim_targets = pos_idx / pos_idx.sum(1,keepdim=True)   
+        sim_targets = 0.9 * sim_targets + 0.1 * torch.ones_like(sim_targets) / sim_targets.size(1)
 
-        ###============== Image-text Matching ===================###
-        text_input_ids_world = text_tokens.input_ids
-        text_attention_mask_world = text_tokens.attention_mask
-        speech_embeds_world = speech_embeds
+        loss_t2s = -torch.sum(F.log_softmax(sim_t2s, dim=1)*sim_targets,dim=1).mean()
+        loss_s2t = -torch.sum(F.log_softmax(sim_s2t, dim=1)*sim_targets,dim=1).mean()     
+        loss_itc = (loss_t2s+loss_s2t)/2  
+                            
+        # loss_itc = (
+        #     F.cross_entropy(sim_s2t, targets, label_smoothing=0.1)
+        #     + F.cross_entropy(sim_t2s, targets, label_smoothing=0.1)
+        # ) / 2
+
+        ###============== Speech-text Matching ===================###
+        text_input_ids_world = concat_all_gather(text_tokens.input_ids)
+        text_attention_mask_world = concat_all_gather(text_tokens.attention_mask)
+        speech_embeds_world = all_gather_with_grad(speech_embeds)
+        
         with torch.no_grad():
-            # if "image_id" in samples.keys():
-            #     mask = torch.eq(image_ids, image_ids_all.t())
-            #     sim_t2i.masked_fill_(mask, -10000)
-            #     sim_i2t.masked_fill_(mask, -10000)
-            # else:    
-            sim_t2i[:, rank * bs : rank * bs + bs].fill_diagonal_(-10000)
-            sim_i2t[:, rank * bs : rank * bs + bs].fill_diagonal_(-10000)            
+            mask = torch.eq(speech_ids, speech_ids_all.t())
+            sim_t2s.masked_fill_(mask, -10000)
+            sim_s2t.masked_fill_(mask, -10000)     
+            
+            # sim_t2s[:, rank * bs : rank * bs + bs].fill_diagonal_(-10000)
+            # sim_s2t[:, rank * bs : rank * bs + bs].fill_diagonal_(-10000)
                 
-            weights_t2i = F.softmax(sim_t2i, dim=1)
-            weights_i2t = F.softmax(sim_i2t, dim=1)
+            weights_t2s = F.softmax(sim_t2s, dim=1)
+            weights_s2t = F.softmax(sim_s2t, dim=1)
 
-        # select a negative image for each text
+        # select a negative speech for each text
         speech_embeds_neg = []
         for b in range(bs):
-            neg_idx = torch.multinomial(weights_t2i[b], 1).item()
+            neg_idx = torch.multinomial(weights_t2s[b], 1).item()
             speech_embeds_neg.append(speech_embeds_world[neg_idx])
         speech_embeds_neg = torch.stack(speech_embeds_neg, dim=0)
 
-        # select a negative text for each image
+        # select a negative text for each speech
         text_ids_neg = []
         text_atts_neg = []
         for b in range(bs):
-            neg_idx = torch.multinomial(weights_i2t[b], 1).item()
+            neg_idx = torch.multinomial(weights_s2t[b], 1).item()
             text_ids_neg.append(text_input_ids_world[neg_idx])
             text_atts_neg.append(text_attention_mask_world[neg_idx])
 
@@ -310,16 +298,14 @@ class Blip2Qformer(Blip2Base):
         ).to(speech.device)
         loss_itm = F.cross_entropy(logits, itm_labels)
 
-        ##================= Image Captioning ========================##
+        ##================= Transcription Generation  ========================##
         decoder_input_ids = text_tokens.input_ids.clone()
         decoder_input_ids[:, 0] = self.tokenizer.bos_token_id
         labels = decoder_input_ids.masked_fill(
             decoder_input_ids == self.tokenizer.pad_token_id, -100
         )
 
-        query_atts = torch.ones(query_tokens.size()[:-1], dtype=torch.long).to(
-            speech.device
-        )
+        query_atts = torch.ones(query_tokens.size()[:-1], dtype=torch.long).to(speech.device)
         attention_mask = torch.cat([query_atts, text_tokens.attention_mask], dim=1)
         lm_output = self.Qformer(
             decoder_input_ids,
@@ -331,53 +317,8 @@ class Blip2Qformer(Blip2Base):
 
         loss_lm = lm_output.loss
         
-
-        ##================= CTC Loss ========================##
-        # ctc_projection = self.ctc_proj(self.dropout_module(query_output.last_hidden_state))
-
-        # lprobs = utils.log_softmax(ctc_projection,dim=-1).contiguous()
-        # input_lengths = lprobs.new_full(
-        #     (lprobs.size(1),), 
-        #     lprobs.size(0), 
-        #     dtype=torch.long
-        # )
-        # pad_mask = (decoder_input_ids != self.tokenizer.pad_token_id) & (decoder_input_ids != self.tokenizer.eos_token_id)
-
-        # targets_flat = decoder_input_ids.masked_select(pad_mask)
-        # target_lengths = pad_mask.sum(-1)
-
-        # # Ensure all tensors are on the same device
-        # breakpoint()
-        # lprobs = lprobs.to(speech.device)
-        # targets_flat = targets_flat.to(speech.device)
-        # input_lengths = input_lengths.to(speech.device)
-        # target_lengths = target_lengths.to(speech.device)
-
-        # # Ensure tensors have correct shapes and types
-        # assert lprobs.dim() == 3, f"Expected lprobs to have 3 dimensions, but got {lprobs.dim()}"
-        # assert targets_flat.dim() == 2 or targets_flat.dim() == 1, f"Expected targets_flat to have 2 dimensions, but got {targets_flat.dim()}"
-        # assert input_lengths.dim() == 1, f"Expected input_lengths to have 1 dimension, but got {input_lengths.dim()}"
-        # assert target_lengths.dim() == 1, f"Expected target_lengths to have 1 dimension, but got {target_lengths.dim()}"
-
-        # assert lprobs.dtype == torch.float32, f"Expected lprobs to be of type torch.float32, but got {lprobs.dtype}"
-        # assert targets_flat.dtype == torch.int64, f"Expected targets_flat to be of type torch.int32, but got {targets_flat.dtype}"
-        # assert input_lengths.dtype == torch.int64, f"Expected input_lengths to be of type torch.int32, but got {input_lengths.dtype}"
-        # assert target_lengths.dtype == torch.int64, f"Expected target_lengths to be of type torch.int32, but got {target_lengths.dtype}"
-        # # breakpoint()
-        
-        # loss_ctc = F.ctc_loss(
-        #     lprobs,
-        #     targets_flat,
-        #     input_lengths,
-        #     target_lengths,
-        #     blank=0,
-        #     reduction="mean",
-        #     zero_infinity=True,
-        # )
-
-        # breakpoint()
         return BlipOutput(
-            loss=loss_itc + loss_itm + loss_lm, # + loss_ctc
+            loss=loss_itc + loss_itm + loss_lm,
             loss_itc=loss_itc,
             loss_itm=loss_itm,
             loss_lm=loss_lm,
@@ -387,8 +328,8 @@ class Blip2Qformer(Blip2Base):
     def generate(
         self,
         samples,
-        use_nucleus_sampling=False,
-        num_beams=3,
+        use_nucleus_sampling=True,
+        num_beams=1,
         max_length=30,
         min_length=10,
         top_p=0.9,
@@ -397,70 +338,69 @@ class Blip2Qformer(Blip2Base):
         """
         Args:
             samples (dict): A dictionary containing the following keys:
-                - image (torch.Tensor): A tensor of shape (batch_size, 3, H, W)
+                - speech (torch.Tensor): A tensor of shape (batch_size, 3, H, W)
             use_nucleus_sampling (bool): Whether to use nucleus sampling. If False, use top-k sampling.
             num_beams (int): Number of beams for beam search. 1 means no beam search.
             max_length (int): The maximum length of the sequence to be generated.
             min_length (int): The minimum length of the sequence to be generated.
             top_p (float): The cumulative probability for nucleus sampling.
             repetition_penalty (float): The parameter for repetition penalty. 1.0 means no penalty.
-            num_captions (int): Number of captions to be generated for each image.
+            num_captions (int): Number of captions to be generated for each speech.
         Returns:
             captions (list): A list of strings of length batch_size * num_captions.
         """
-        image = samples["image"]
-        image_embeds = self.ln_vision(self.visual_encoder(image))
-
-        if not use_nucleus_sampling:
-            image_embeds = image_embeds.repeat_interleave(num_beams, dim=0)
-        else:
-            num_beams = 1
-        image_atts = torch.ones(image_embeds.size()[:-1], dtype=torch.long).to(
-            image.device
+        speech = samples["source"]
+        codes = self.speech_encoder.encode(speech.unsqueeze(1), 1) # codes: (n_q, B, T)
+        speech_embeds = self.speech_encoder.quantizer.decode(codes).transpose(1, 2)
+        speech_embeds = self.ln_speech(speech_embeds)
+        speech_atts = torch.ones(speech_embeds.size()[:-1], dtype=torch.long).to(
+            speech.device
         )
-
         model_kwargs = {
-            "encoder_hidden_states": image_embeds,
-            "encoder_attention_mask": image_atts,
+            "encoder_hidden_states": speech_embeds,  # used in cross attention
+            "encoder_attention_mask": speech_atts,  # used in cross attention
         }
 
-        input_ids = (
-            torch.LongTensor(image.size(0), 1)
-            .fill_(self.tokenizer.bos_token_id)
-            .to(image.device)
-        )
-        query_tokens = self.query_tokens.expand(image_embeds.shape[0], -1, -1)
+        # input_ids = (
+        #     torch.LongTensor(speech.size(0), 1)
+        #     .fill_(self.tokenizer.bos_token_id)
+        #     .to(speech.device)
+        # )
+        prompt = ""
+        query_tokens = self.query_tokens.expand(speech_embeds.shape[0], -1, -1)
 
-        outputs = self.Qformer.generate(
-            input_ids=input_ids,
+        ## No need for beam search or any sampling strategy since we just decoding query tokens
+        query_outputs = self.Qformer.bert(
             query_embeds=query_tokens,
-            max_length=max_length,
-            min_length=min_length,
-            num_beams=num_beams,
-            do_sample=use_nucleus_sampling,
-            top_p=top_p,
-            eos_token_id=self.tokenizer.sep_token_id,
-            pad_token_id=self.tokenizer.pad_token_id,
-            **model_kwargs
+            encoder_hidden_states=speech_embeds,
+            encoder_attention_mask=speech_atts,
+            use_cache=True,
+            return_dict=True,
         )
-        captions = self.tokenizer.batch_decode(outputs, skip_special_tokens=True)
+        lm_outputs = self.Qformer.cls(query_outputs[0])
+        captions = self.tokenizer.batch_decode(lm_outputs, skip_special_tokens=True)
+
+        breakpoint()
         return captions
 
-    def forward_image(self, image):
-        image_embeds = self.ln_vision(self.visual_encoder(image))
-        image_atts = torch.ones(image_embeds.size()[:-1], dtype=torch.long).to(
-            image.device
-        )
+    def forward_speech(self, speech):
 
-        query_tokens = self.query_tokens.expand(image_embeds.shape[0], -1, -1)
+        codes = self.speech_encoder.encode(speech.unsqueeze(1), 1) # codes: (n_q, B, T)
+        speech_embeds = self.speech_encoder.quantizer.decode(codes).transpose(1, 2)
+        speech_embeds = self.ln_speech(speech_embeds)
+        speech_atts = torch.ones(speech_embeds.size()[:-1], dtype=torch.long).to(
+            speech.device
+        )
+        
+        query_tokens = self.query_tokens.expand(speech_embeds.shape[0], -1, -1)
 
         query_output = self.Qformer.bert(
             query_embeds=query_tokens,
-            encoder_hidden_states=image_embeds,
-            encoder_attention_mask=image_atts,
+            encoder_hidden_states=speech_embeds,
+            encoder_attention_mask=speech_atts,
             return_dict=True,
         )
-        return query_output.last_hidden_state, image_embeds
+        return query_output.last_hidden_state, speech_embeds
 
     def forward_text(self, text_tokens):
         text_output = self.Qformer.bert(
@@ -468,7 +408,7 @@ class Blip2Qformer(Blip2Base):
             attention_mask=text_tokens.attention_mask,
             return_dict=True,
         )
-        return text_output.last_hidden_state[:, 0, :]
+        return text_output.last_hidden_state
 
     def compute_itm(self, image_inputs, text_ids, text_atts):
         image_atts = torch.ones(image_inputs.size()[:-1], dtype=torch.long).to(
@@ -498,39 +438,39 @@ class Blip2Qformer(Blip2Base):
         Extract features for multimodal or unimodal samples.
         Args:
             samples (dict): A dictionary of samples, containing the following keys:
-                - image (torch.Tensor): A tensor of shape (B, C, H, W) containing the image.
+                - speech (torch.Tensor): A tensor of shape (B, C, H, W) containing the speech.
                     Raw images should be preprocessed before being passed to feature extractor.
                 - text_input (list): A list of strings containing the text, length B.
-            mode (str): The mode of feature extraction. Can be either "multimodal", "text" or "image".
-                If "multimodal", return image features and multimodal features;
+            mode (str): The mode of feature extraction. Can be either "multimodal", "text" or "speech".
+                If "multimodal", return speech features and multimodal features;
                 if "text", return text features;
-                if "image", return image features.
+                if "speech", return speech features.
                 Default: "multimodal".
         Returns:
             BlipOutputFeatures: A BlipOutputFeatures object containing the features.
                 See lavis/models/blip_models/blip_outputs.py for more details.
         """
-        image = samples.get("image")
+        speech = samples.get("speech")
         caption = samples.get("text_input")
 
-        # assert mode is one of "image", "text", "multimodal"
+        # assert mode is one of "speech", "text", "multimodal"
         assert mode in [
-            "image",
+            "speech",
             "text",
             "multimodal",
-        ], "mode must be one of 'image', 'text', 'multimodal'"
+        ], "mode must be one of 'speech', 'text', 'multimodal'"
 
         # initalize output
         image_embeds, text_embeds, multimodal_embeds = None, None, None
         image_features, text_features = None, None
 
-        if mode == "image":
+        if mode == "speech":
             assert (
-                image is not None
-            ), "Image is not provided for mode 'image' or 'multimodal'"
+                speech is not None
+            ), "Speech is not provided for mode 'speech' or 'multimodal'"
             # return query features
             with self.maybe_autocast():
-                image_embeds_frozen = self.ln_vision(self.visual_encoder(image))
+                image_embeds_frozen = self.ln_vision(self.visual_encoder(speech))
             image_embeds_frozen = image_embeds_frozen.float()
             image_atts = torch.ones(
                 image_embeds_frozen.size()[:-1], dtype=torch.long
@@ -570,7 +510,7 @@ class Blip2Qformer(Blip2Base):
         elif mode == "multimodal":
             # return multimodel query features
             with self.maybe_autocast():
-                image_embeds_frozen = self.ln_vision(self.visual_encoder(image))
+                image_embeds_frozen = self.ln_vision(self.visual_encoder(speech))
             image_embeds_frozen = image_embeds_frozen.float()
             image_atts = torch.ones(
                 image_embeds_frozen.size()[:-1], dtype=torch.long
@@ -608,25 +548,19 @@ class Blip2Qformer(Blip2Base):
 
     @classmethod
     def from_config(cls, cfg):
-        vit_model = cfg.get("vit_model", "eva_clip_g")
-        img_size = cfg.get("image_size")
         num_query_token = cfg.get("num_query_token")
         cross_attention_freq = cfg.get("cross_attention_freq", 2)
 
         drop_path_rate = cfg.get("drop_path_rate", 0)
         use_grad_checkpoint = cfg.get("use_grad_checkpoint", False)
-        vit_precision = cfg.get("vit_precision", "fp16")
-        freeze_vit = cfg.get("freeze_vit", True)
+        freeze_enc = cfg.get("freeze_enc", True)
 
-        max_txt_len = cfg.get("max_txt_len", 32)
+        max_txt_len = cfg.get("max_txt_len", 64)
 
         model = cls(
-            vit_model=vit_model,
-            img_size=img_size,
             drop_path_rate=drop_path_rate,
             use_grad_checkpoint=use_grad_checkpoint,
-            vit_precision=vit_precision,
-            freeze_vit=freeze_vit,
+            freeze_enc=freeze_enc,
             num_query_token=num_query_token,
             cross_attention_freq=cross_attention_freq,
             max_txt_len=max_txt_len,
@@ -637,7 +571,7 @@ class Blip2Qformer(Blip2Base):
 
     def compute_sim_matrix(self, data_loader, task_cfg):
         """
-        Compute similarity i2t, t2i matrix for the given data loader.
+        Compute similarity s2t, t2s matrix for the given data loader.
         """
         k_test = task_cfg.k_test
 
@@ -645,6 +579,6 @@ class Blip2Qformer(Blip2Base):
 
 
 
-@register_model_architecture(model_name="speech_qformer", arch_name="speech_qformer")
+@register_model_architecture(model_name="speech_qformer_base", arch_name="speech_qformer_base")
 def base_architecture(args):
     pass
