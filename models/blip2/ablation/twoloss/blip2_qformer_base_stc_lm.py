@@ -42,8 +42,8 @@ class LayerNorm(nn.LayerNorm):
         ret = super().forward(x)
         return ret.type(orig_type)
 
-@register_model("speech_qformer_base")
-class Blip2QformerBase(Blip2Base):
+@register_model("speech_qformer_base_stc_lm")
+class Blip2QformerBaseSTCLM(Blip2Base):
 
     @classmethod
     def build_model(cls, args, task):
@@ -240,9 +240,9 @@ class Blip2QformerBase(Blip2Base):
         loss_lm = lm_output.loss
         
         return BlipOutput(
-            loss=loss_itc + loss_itm + loss_lm,
+            loss=loss_itc + loss_lm,
             loss_itc=loss_itc,
-            loss_itm=loss_itm,
+            loss_itm=None,
             loss_lm=loss_lm,
         )
 
@@ -501,6 +501,6 @@ class Blip2QformerBase(Blip2Base):
 
 
 
-@register_model_architecture(model_name="speech_qformer_base", arch_name="speech_qformer_base")
+@register_model_architecture(model_name="speech_qformer_base_stc_lm", arch_name="speech_qformer_base_stc_lm")
 def base_architecture(args):
     pass

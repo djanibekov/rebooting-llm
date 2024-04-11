@@ -32,6 +32,7 @@ from fairseq.modules import (
 
 
 from fairseq import utils
+from transformers import SpeechT5Processor
 
 
 class LayerNorm(nn.LayerNorm):
@@ -155,149 +156,139 @@ class Blip2QformerTokenized(Blip2Base):
         # speech_embeds = self.ln_speech(speech_embeds.transpose(1, 2))
 
         query_tokens = self.query_tokens.expand(speech_embeds.shape[0], -1, -1)
+        query_output = self.Qformer.bert(query_embeds=query_tokens,encoder_hidden_states=speech_embeds,encoder_attention_mask=speech_atts,use_cache=True,return_dict=True,)
 
-        query_output = self.Qformer.bert(
-            query_embeds=query_tokens,
-            encoder_hidden_states=speech_embeds,
-            encoder_attention_mask=speech_atts,
-            use_cache=True,
-            return_dict=True,
-        )
+        speech_feats = self.speech_proj(query_output.last_hidden_state)
 
-        speech_feats = F.normalize(
-            self.speech_proj(query_output.last_hidden_state), dim=-1
-        )
-
-        text_tokens = self.tokenizer(
-            text, 
-            padding="max_length", 
-            truncation=True, 
-            max_length=self.max_txt_len, 
-            return_tensors="pt",
-        ).to(speech_embeds.device)
+        text_tokens = self.tokenizer(text=text, padding="max_length", return_tensors="pt",).to(speech_embeds.device)
 
         text_output = self.Qformer.bert(
             text_tokens.input_ids,
             attention_mask=text_tokens.attention_mask,
             return_dict=True,
         )
-        text_feat = F.normalize(self.text_proj(text_output.last_hidden_state[:, 0, :]), dim=-1)
-        # breakpoint()
+        text_feat = self.text_proj(text_output.last_hidden_state[:, 0, :])
 
-        ###============== Speech-text Contrastive ===================###
-        speech_feats_all = concat_all_gather(speech_feats)
-        text_feat_all = concat_all_gather(text_feat)  # [batch_size*num_gpu, embed_dim]
+        kl_losses_speech_text = []
+        for i in range(query_tokens.shape[1]):
+            kl_losses_speech_text.append(F.smooth_l1_loss(speech_feats[:, i, :].squeeze(), text_feat))
 
-        sim_q2t = torch.matmul(speech_feats.unsqueeze(1), text_feat_all.unsqueeze(-1)).squeeze()
-        # [batch_size, batch_size*num_gpu, num_query_tokens]
+        kl_loss = min(kl_losses_speech_text)
 
-        # speech-text similarity: aggregate across all query tokens
-        sim_s2t, _ = sim_q2t.max(-1)
-        sim_s2t = sim_s2t / self.temp
+        # ###============== Speech-text Contrastive ===================###
+        # speech_feats_all = concat_all_gather(speech_feats)
+        # text_feat_all = concat_all_gather(text_feat)  # [batch_size*num_gpu, embed_dim]
 
-        # text-query similarity: [batch_size, batch_size*num_gpu, num_query_tokens]
-        sim_t2q = torch.matmul(text_feat.unsqueeze(1).unsqueeze(1), speech_feats_all.permute(0, 2, 1)).squeeze()
+        # sim_q2t = torch.matmul(speech_feats.unsqueeze(1), text_feat_all.unsqueeze(-1)).squeeze()
+        # # [batch_size, batch_size*num_gpu, num_query_tokens]
 
-        # text-speech similarity: aggregate across all query tokens
-        sim_t2s, _ = sim_t2q.max(-1)
-        sim_t2s = sim_t2s / self.temp  # [batch_size, batch_size*num_gpu]
+        # # speech-text similarity: aggregate across all query tokens
+        # sim_s2t, _ = sim_q2t.max(-1)
+        # sim_s2t = sim_s2t / self.temp
+
+        # # text-query similarity: [batch_size, batch_size*num_gpu, num_query_tokens]
+        # sim_t2q = torch.matmul(text_feat.unsqueeze(1).unsqueeze(1), speech_feats_all.permute(0, 2, 1)).squeeze()
+
+        # # text-speech similarity: aggregate across all query tokens
+        # sim_t2s, _ = sim_t2q.max(-1)
+        # sim_t2s = sim_t2s / self.temp  # [batch_size, batch_size*num_gpu]
         
+        # # rank = dist.get_rank()
         # rank = dist.get_rank()
-        rank = dist.get_rank()
-        bs = speech_embeds.size(0)
-        targets = torch.linspace(rank * bs, rank * bs + bs - 1, bs, dtype=int).to(
-            speech_embeds.device
-        )
+        # bs = speech_embeds.size(0)
+        # targets = torch.linspace(rank * bs, rank * bs + bs - 1, bs, dtype=int).to(
+        #     speech_embeds.device
+        # )
 
 
-        speech_ids = samples["speech_id"].view(-1,1)
-        speech_ids_all = concat_all_gather(speech_ids)
-        pos_idx = torch.eq(speech_ids, speech_ids_all.t()).float()       
-        sim_targets = pos_idx / pos_idx.sum(1,keepdim=True)   
-        sim_targets = 0.9 * sim_targets + 0.1 * torch.ones_like(sim_targets) / sim_targets.size(1)
+        # speech_ids = samples["speech_id"].view(-1,1)
+        # speech_ids_all = concat_all_gather(speech_ids)
+        # pos_idx = torch.eq(speech_ids, speech_ids_all.t()).float()       
+        # sim_targets = pos_idx / pos_idx.sum(1,keepdim=True)   
+        # sim_targets = 0.9 * sim_targets + 0.1 * torch.ones_like(sim_targets) / sim_targets.size(1)
 
-        loss_t2s = -torch.sum(F.log_softmax(sim_t2s, dim=1)*sim_targets,dim=1).mean()
-        loss_s2t = -torch.sum(F.log_softmax(sim_s2t, dim=1)*sim_targets,dim=1).mean()     
-        loss_itc = (loss_t2s+loss_s2t)/2  
+        # loss_t2s = -torch.sum(F.log_softmax(sim_t2s, dim=1)*sim_targets,dim=1).mean()
+        # loss_s2t = -torch.sum(F.log_softmax(sim_s2t, dim=1)*sim_targets,dim=1).mean()     
+        # loss_itc = (loss_t2s+loss_s2t)/2  
                             
-        # loss_itc = (
-        #     F.cross_entropy(sim_s2t, targets, label_smoothing=0.1)
-        #     + F.cross_entropy(sim_t2s, targets, label_smoothing=0.1)
-        # ) / 2
+        # # loss_itc = (
+        # #     F.cross_entropy(sim_s2t, targets, label_smoothing=0.1)
+        # #     + F.cross_entropy(sim_t2s, targets, label_smoothing=0.1)
+        # # ) / 2
 
-        ###============== Speech-text Matching ===================###
-        text_input_ids_world = concat_all_gather(text_tokens.input_ids)
-        text_attention_mask_world = concat_all_gather(text_tokens.attention_mask)
-        speech_embeds_world = all_gather_with_grad(speech_embeds)
+        # ###============== Speech-text Matching ===================###
+        # text_input_ids_world = concat_all_gather(text_tokens.input_ids)
+        # text_attention_mask_world = concat_all_gather(text_tokens.attention_mask)
+        # speech_embeds_world = all_gather_with_grad(speech_embeds)
         
-        with torch.no_grad():
-            mask = torch.eq(speech_ids, speech_ids_all.t())
-            sim_t2s.masked_fill_(mask, -10000)
-            sim_s2t.masked_fill_(mask, -10000)     
+        # with torch.no_grad():
+        #     mask = torch.eq(speech_ids, speech_ids_all.t())
+        #     sim_t2s.masked_fill_(mask, -10000)
+        #     sim_s2t.masked_fill_(mask, -10000)     
             
-            # sim_t2s[:, rank * bs : rank * bs + bs].fill_diagonal_(-10000)
-            # sim_s2t[:, rank * bs : rank * bs + bs].fill_diagonal_(-10000)
+        #     # sim_t2s[:, rank * bs : rank * bs + bs].fill_diagonal_(-10000)
+        #     # sim_s2t[:, rank * bs : rank * bs + bs].fill_diagonal_(-10000)
                 
-            weights_t2s = F.softmax(sim_t2s, dim=1)
-            weights_s2t = F.softmax(sim_s2t, dim=1)
+        #     weights_t2s = F.softmax(sim_t2s, dim=1)
+        #     weights_s2t = F.softmax(sim_s2t, dim=1)
 
-        # select a negative speech for each text
-        speech_embeds_neg = []
-        for b in range(bs):
-            neg_idx = torch.multinomial(weights_t2s[b], 1).item()
-            speech_embeds_neg.append(speech_embeds_world[neg_idx])
-        speech_embeds_neg = torch.stack(speech_embeds_neg, dim=0)
+        # # select a negative speech for each text
+        # speech_embeds_neg = []
+        # for b in range(bs):
+        #     neg_idx = torch.multinomial(weights_t2s[b], 1).item()
+        #     speech_embeds_neg.append(speech_embeds_world[neg_idx])
+        # speech_embeds_neg = torch.stack(speech_embeds_neg, dim=0)
 
-        # select a negative text for each speech
-        text_ids_neg = []
-        text_atts_neg = []
-        for b in range(bs):
-            neg_idx = torch.multinomial(weights_s2t[b], 1).item()
-            text_ids_neg.append(text_input_ids_world[neg_idx])
-            text_atts_neg.append(text_attention_mask_world[neg_idx])
+        # # select a negative text for each speech
+        # text_ids_neg = []
+        # text_atts_neg = []
+        # for b in range(bs):
+        #     neg_idx = torch.multinomial(weights_s2t[b], 1).item()
+        #     text_ids_neg.append(text_input_ids_world[neg_idx])
+        #     text_atts_neg.append(text_attention_mask_world[neg_idx])
 
-        text_ids_neg = torch.stack(text_ids_neg, dim=0)
-        text_atts_neg = torch.stack(text_atts_neg, dim=0)
+        # text_ids_neg = torch.stack(text_ids_neg, dim=0)
+        # text_atts_neg = torch.stack(text_atts_neg, dim=0)
 
-        text_ids_all = torch.cat(
-            [text_tokens.input_ids, text_tokens.input_ids, text_ids_neg], dim=0
-        )  # pos, pos, neg
-        text_atts_all = torch.cat(
-            [text_tokens.attention_mask, text_tokens.attention_mask, text_atts_neg],
-            dim=0,
-        )
+        # text_ids_all = torch.cat(
+        #     [text_tokens.input_ids, text_tokens.input_ids, text_ids_neg], dim=0
+        # )  # pos, pos, neg
+        # text_atts_all = torch.cat(
+        #     [text_tokens.attention_mask, text_tokens.attention_mask, text_atts_neg],
+        #     dim=0,
+        # )
 
-        query_tokens_itm = self.query_tokens.expand(text_ids_all.shape[0], -1, -1)
-        query_atts_itm = torch.ones(query_tokens_itm.size()[:-1], dtype=torch.long).to(
-            speech_embeds.device
-        )
-        attention_mask_all = torch.cat([query_atts_itm, text_atts_all], dim=1)
+        # query_tokens_itm = self.query_tokens.expand(text_ids_all.shape[0], -1, -1)
+        # query_atts_itm = torch.ones(query_tokens_itm.size()[:-1], dtype=torch.long).to(
+        #     speech_embeds.device
+        # )
+        # attention_mask_all = torch.cat([query_atts_itm, text_atts_all], dim=1)
 
-        speech_embeds_all = torch.cat(
-            [speech_embeds, speech_embeds_neg, speech_embeds], dim=0
-        )  # pos, neg, pos
-        speech_atts_all = torch.ones(speech_embeds_all.size()[:-1], dtype=torch.long).to(
-            speech_embeds.device
-        )
+        # speech_embeds_all = torch.cat(
+        #     [speech_embeds, speech_embeds_neg, speech_embeds], dim=0
+        # )  # pos, neg, pos
+        # speech_atts_all = torch.ones(speech_embeds_all.size()[:-1], dtype=torch.long).to(
+        #     speech_embeds.device
+        # )
 
-        output_itm = self.Qformer.bert(
-            text_ids_all,
-            query_embeds=query_tokens_itm,
-            attention_mask=attention_mask_all,
-            encoder_hidden_states=speech_embeds_all,
-            encoder_attention_mask=speech_atts_all,
-            return_dict=True,
-        )
+        # output_itm = self.Qformer.bert(
+        #     text_ids_all,
+        #     query_embeds=query_tokens_itm,
+        #     attention_mask=attention_mask_all,
+        #     encoder_hidden_states=speech_embeds_all,
+        #     encoder_attention_mask=speech_atts_all,
+        #     return_dict=True,
+        # )
 
-        vl_embeddings = output_itm.last_hidden_state[:, : query_tokens_itm.size(1), :]
-        vl_output = self.itm_head(vl_embeddings)
-        logits = vl_output.mean(dim=1)
+        # vl_embeddings = output_itm.last_hidden_state[:, : query_tokens_itm.size(1), :]
+        # vl_output = self.itm_head(vl_embeddings)
+        # logits = vl_output.mean(dim=1)
 
-        itm_labels = torch.cat(
-            [torch.ones(bs, dtype=torch.long), torch.zeros(2 * bs, dtype=torch.long)],
-            dim=0,
-        ).to(speech_embeds.device)
-        loss_itm = F.cross_entropy(logits, itm_labels)
+        # itm_labels = torch.cat(
+        #     [torch.ones(bs, dtype=torch.long), torch.zeros(2 * bs, dtype=torch.long)],
+        #     dim=0,
+        # ).to(speech_embeds.device)
+        # loss_itm = F.cross_entropy(logits, itm_labels)
 
         ##================= Transcription Generation  ========================##
         decoder_input_ids = text_tokens.input_ids.clone()
@@ -319,9 +310,9 @@ class Blip2QformerTokenized(Blip2Base):
         loss_lm = lm_output.loss
         
         return BlipOutput(
-            loss=loss_itc + loss_itm + loss_lm,
-            loss_itc=loss_itc,
-            loss_itm=loss_itm,
+            loss=loss_lm + kl_loss,
+            loss_itc=kl_loss,
+            loss_itm=None,
             loss_lm=loss_lm,
         )
 

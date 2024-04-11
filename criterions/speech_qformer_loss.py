@@ -24,15 +24,15 @@ class SpeechtoQformerLoss(FairseqCriterion):
 
         sample_size = len(sample["target"])
         loss = output['loss']
-        loss_itc = output['loss_itc']
-        loss_itm = output['loss_itm']
-        loss_lm = output['loss_lm']
+        # loss_itc = output['loss_itc']
+        # loss_itm = output['loss_itm']
+        # loss_lm = output['loss_lm']
 
         logging_output = {
             "loss": output['loss'].item(),
-            "loss_itc": output['loss_itc'].item(),
-            "loss_itm": output['loss_itm'].item(),
-            "loss_lm": output['loss_lm'].item(),
+            "loss_itc": output['loss_itc'].item() if output.get('loss_itc', None) is not None else 0,
+            "loss_itm": output['loss_itm'].item() if output.get('loss_itm', None) is not None else 0,
+            "loss_lm": output['loss_lm'].item() if output.get('loss_lm', None) is not None else 0,
             "ntokens": sample["ntokens"],
             "nsentences": len(sample["target"][0]),
             "sample_size": sample_size,

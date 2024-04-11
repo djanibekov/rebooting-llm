@@ -42,8 +42,8 @@ class LayerNorm(nn.LayerNorm):
         ret = super().forward(x)
         return ret.type(orig_type)
 
-@register_model("speech_qformer_base")
-class Blip2QformerBase(Blip2Base):
+@register_model("speech_qformer_base_stm_lm")
+class Blip2QformerBaseSTMLM(Blip2Base):
 
     @classmethod
     def build_model(cls, args, task):
@@ -195,6 +195,10 @@ class Blip2QformerBase(Blip2Base):
         # text-speech similarity: aggregate across all query tokens
         sim_t2s, _ = sim_t2q.max(-1)
         sim_t2s = sim_t2s / self.temp  # [batch_size, batch_size*num_gpu]
+
+        speech_ids = samples["speech_id"].view(-1,1)
+        speech_ids_all = concat_all_gather(speech_ids)
+        bs = speech.size(0)
         
         ###============== Speech-text Matching ===================###
         text_input_ids_world = concat_all_gather(text_tokens.input_ids)
@@ -290,8 +294,8 @@ class Blip2QformerBase(Blip2Base):
         loss_lm = lm_output.loss
         
         return BlipOutput(
-            loss=loss_itc + loss_itm + loss_lm,
-            loss_itc=loss_itc,
+            loss=loss_itm + loss_lm,
+            loss_itc=None,
             loss_itm=loss_itm,
             loss_lm=loss_lm,
         )
@@ -551,6 +555,6 @@ class Blip2QformerBase(Blip2Base):
 
 
 
-@register_model_architecture(model_name="speech_qformer_base", arch_name="speech_qformer_base")
+@register_model_architecture(model_name="speech_qformer_base_stm_lm", arch_name="speech_qformer_base_stm_lm")
 def base_architecture(args):
     pass

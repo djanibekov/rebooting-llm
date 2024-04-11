@@ -42,7 +42,7 @@ class LayerNorm(nn.LayerNorm):
         ret = super().forward(x)
         return ret.type(orig_type)
 
-@register_model("speech_qformer")
+@register_model("speech_qformer")  # speech_qformer_large
 class Blip2QformerLarge(Blip2Base):
 
     @classmethod
