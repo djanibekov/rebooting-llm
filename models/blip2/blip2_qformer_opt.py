@@ -4,77 +4,121 @@
  SPDX-License-Identifier: BSD-3-Clause
  For full license text, see the LICENSE file in the repo root or https://opensource.org/licenses/BSD-3-Clause
 """
+import json
 import logging
 from packaging import version
 
 import torch
-from torch.cuda.amp import autocast as autocast
 import torch.nn as nn
+from fairseq.models import register_model, register_model_architecture
 
-from lavis.common.registry import registry
-from lavis.models.blip2_models.blip2 import Blip2Base, disabled_train
-# from lavis.models.blip2_models.modeling_opt import OPTForCausalLM, OPTConfig
+from .blip2 import Blip2Base, disabled_train
 from transformers import AutoTokenizer, OPTForCausalLM, OPTConfig
 import transformers
 
+from ..speechtokenizer.model import SpeechTokenizer
 
-@registry.register_model("blip2_opt")
+class LayerNorm(nn.LayerNorm):
+    """Subclass torch's LayerNorm to handle fp16."""
+
+    def forward(self, x: torch.Tensor):
+        orig_type = x.dtype
+        ret = super().forward(x)
+        return ret.type(orig_type)
+
+@register_model("speech_qformer_base_opt")
 class Blip2OPT(Blip2Base):
-    """
-    BLIP2 OPT model.
-    Supported model types:
-        - pretrained_opt2.7b: pretrained model with OPT2.7b
-        - pretrained_opt6.7b: pretrained model with OPT6.7b
-        - caption_coco_opt2.7b: fintuned image captioning model with OPT2.7b
-        - caption_coco_opt6.7b: fintuned image captioning model with OPT6.7b
-    Usage:
-        >>> from lavis.models import load_model
-        >>> model = load_model("blip2_opt", "caption_coco_opt2.7b")
-    """
+    @classmethod
+    def build_model(cls, args, task):
+        """Build a new model instance."""
+        base_architecture(args)
+        speech_encoder, config = cls.build_speech_model({
+            'speech_model_file_path': args.speechtokenizer_ckptpath,
+            'speech_model_config_path': args.speechtokenizer_configpath,
+            'freeze_enc': True
+        })      
+        Qformer, query_tokens, tokenizer = cls.build_qformer({
+            'codebook_size': config['codebook_size'],
+            'cross_attention_freq': args.cross_attention_freq,
+            'num_query_token': args.num_query_token
+        })
 
-    PRETRAINED_MODEL_CONFIG_DICT = {
-        "pretrain_opt2.7b": "configs/models/blip2/blip2_pretrain_opt2.7b.yaml",
-        "pretrain_opt6.7b": "configs/models/blip2/blip2_pretrain_opt6.7b.yaml",
-        "caption_coco_opt2.7b": "configs/models/blip2/blip2_caption_opt2.7b.yaml",
-        "caption_coco_opt6.7b": "configs/models/blip2/blip2_caption_opt6.7b.yaml",
-    }
+        return cls(
+            args,
+            speech_encoder,
+            Qformer, 
+            query_tokens,
+            tokenizer,
+            config
+        )
+
+    @classmethod
+    def build_speech_model(cls, args, dictionary=None, embed_tokens=None):
+        speech_encoder = SpeechTokenizer.load_from_checkpoint(
+            args['speech_model_config_path'], args['speech_model_file_path']
+        )
+        if hasattr(speech_encoder, "decoder"):   # Pruning
+            del speech_encoder.decoder
+
+        with open(args['speech_model_config_path']) as config_file:
+            config = json.load(config_file)
+
+        if args['freeze_enc']:
+            for name, param in speech_encoder.named_parameters():
+                param.requires_grad = False
+            speech_encoder.eval()
+
+        return speech_encoder, config
+    
+    @classmethod
+    def build_qformer(cls, args):
+        tokenizer = cls.init_tokenizer()
+        Qformer, query_tokens = cls.init_Qformer(
+            args['num_query_token'], args['codebook_size'], args['cross_attention_freq']
+        )
+        Qformer.resize_token_embeddings(len(tokenizer))
+
+        return Qformer, query_tokens, tokenizer
+
+    @staticmethod
+    def add_args(parser):
+        parser.add_argument("--cross-attention-freq", type=int)
+        parser.add_argument("--num-query-token", type=int)
+        parser.add_argument("--speech-model-config-path", type=str)
+        parser.add_argument("--speech-model-file-path", type=str)
+        parser.add_argument("--qformer-dim", type=str)
+        parser.add_argument("--opt-model", type=str)
+        parser.add_argument("--pretrained", type=str)
+       
 
     def __init__(
         self,
-        vit_model="eva_clip_g",
-        img_size=224,
+        args,
+        speech_encoder,
+        Qformer, 
+        query_tokens,
+        tokenizer,
+        speech_config,
         drop_path_rate=0,
         use_grad_checkpoint=False,
-        vit_precision="fp16",
-        freeze_vit=True,
-        num_query_token=32,
-        opt_model="facebook/opt-2.7b",
-        prompt="",
-        max_txt_len=32,
-        apply_lemmatizer=False,
+        embed_dim=256,
+        max_txt_len=100,
+        freeze_encoder=True,
+        prompt=""
     ):
-        """
-        apply_lemmatizer: when set to True, postprocess predict_answers() result with lemmas.
-        """
         super().__init__()
-        transformers_version = version.parse(transformers.__version__)
-        assert transformers_version >= version.parse("4.27"), "BLIP-2 OPT requires transformers>=4.27"
-        
         self.tokenizer = self.init_tokenizer()
 
-        self.visual_encoder, self.ln_vision = self.init_vision_encoder(
-            vit_model, img_size, drop_path_rate, use_grad_checkpoint, vit_precision
-        )
-        if freeze_vit:
-            for name, param in self.visual_encoder.named_parameters():
+        self.speech_encoder = speech_encoder
+        self.ln_speech = LayerNorm(speech_config['codebook_size'])
+        if freeze_encoder:
+            for name, param in self.speech_encoder.named_parameters():
                 param.requires_grad = False
-            self.visual_encoder = self.visual_encoder.eval()
-            self.visual_encoder.train = disabled_train
-            logging.info("freeze vision encoder")
+            self.speech_encoder = self.speech_encoder.eval()
+            self.speech_encoder.train = disabled_train
+            logging.info("freeze speech encoder")
 
-        self.Qformer, self.query_tokens = self.init_Qformer(
-            num_query_token, self.visual_encoder.num_features
-        )
+        self.Qformer, self.query_tokens = Qformer, query_tokens
         self.Qformer.cls = None
         self.Qformer.bert.embeddings.word_embeddings = None
         self.Qformer.bert.embeddings.position_embeddings = None
@@ -82,10 +126,8 @@ class Blip2OPT(Blip2Base):
             layer.output = None
             layer.intermediate = None
 
-        self.opt_tokenizer = AutoTokenizer.from_pretrained(opt_model, use_fast=False)
-        self.opt_model = OPTForCausalLM.from_pretrained(
-            opt_model, torch_dtype=torch.float16
-        )
+        self.opt_tokenizer = AutoTokenizer.from_pretrained(args.opt_model, use_fast=False)
+        self.opt_model = OPTForCausalLM.from_pretrained(args.opt_model)
         for name, param in self.opt_model.named_parameters():
             param.requires_grad = False
         self.eos_token_id = self.opt_tokenizer(
@@ -100,40 +142,46 @@ class Blip2OPT(Blip2Base):
         self.prompt = prompt
         prompt_tokens = self.opt_tokenizer(self.prompt, return_tensors="pt")
         self.prompt_length = prompt_tokens.attention_mask.sum(1)
-        
-        self._apply_lemmatizer = apply_lemmatizer
-        self._lemmatizer = None       
+
+        self.speechtokenizer_padding_idx = 931
+
+
+        checkpoint = torch.load(args.pretrained, map_location="cpu")
+        state_dict = checkpoint["model"]
+
+        msg = self.load_state_dict(state_dict, strict=False)
+
+        # logging.info("Missing keys {}".format(msg.missing_keys))
+        logging.info("load checkpoint from %s" % args.pretrained)
+      
 
     def forward(self, samples):
-        image = samples["image"]
-        with self.maybe_autocast():
-            image_embeds = self.ln_vision(self.visual_encoder(image))
-        image_atts = torch.ones(image_embeds.size()[:-1], dtype=torch.long).to(
-            image.device
-        )
+        speech = samples["source"]
+        speech_embeds, codes = self.speech_encoder.forward_feature(speech.unsqueeze(1), [0])
+        speech_embeds = self.ln_speech(speech_embeds[0].transpose(1, 2))
 
-        query_tokens = self.query_tokens.expand(image_embeds.shape[0], -1, -1)
+        speech_atts = codes[0] != self.speechtokenizer_padding_idx
+
+        query_tokens = self.query_tokens.expand(speech_embeds.shape[0], -1, -1)
         query_output = self.Qformer.bert(
             query_embeds=query_tokens,
-            encoder_hidden_states=image_embeds,
-            encoder_attention_mask=image_atts,
+            encoder_hidden_states=speech_embeds,
+            encoder_attention_mask=speech_atts,
             return_dict=True,
         )
 
         inputs_opt = self.opt_proj(query_output.last_hidden_state)
-        atts_opt = torch.ones(inputs_opt.size()[:-1], dtype=torch.long).to(image.device)
+        atts_opt = torch.ones(inputs_opt.size()[:-1], dtype=torch.long).to(speech.device)
 
         self.opt_tokenizer.padding_side = "right"
 
-        text = [t + "\n" for t in samples["text_input"]]
+        text = [t + "\n" for t in samples["target"][0]]
 
         opt_tokens = self.opt_tokenizer(
             text,
             return_tensors="pt",
             padding="longest",
-            truncation=True,
-            max_length=self.max_txt_len,
-        ).to(image.device)
+        ).to(speech.device)
 
         targets = opt_tokens.input_ids.masked_fill(
             opt_tokens.input_ids == self.opt_tokenizer.pad_token_id, -100
@@ -142,7 +190,7 @@ class Blip2OPT(Blip2Base):
             targets[:, : self.prompt_length] = -100  # do not apply loss to the prompt
 
         empty_targets = (
-            torch.ones(atts_opt.size(), dtype=torch.long).to(image.device).fill_(-100)
+            torch.ones(atts_opt.size(), dtype=torch.long).to(speech.device).fill_(-100)
         )
         targets = torch.cat([empty_targets, targets], dim=1)
 
@@ -150,13 +198,12 @@ class Blip2OPT(Blip2Base):
         inputs_embeds = torch.cat([inputs_opt, inputs_embeds], dim=1)
         attention_mask = torch.cat([atts_opt, opt_tokens.attention_mask], dim=1)
 
-        with self.maybe_autocast():
-            outputs = self.opt_model(
-                inputs_embeds=inputs_embeds,
-                attention_mask=attention_mask,
-                return_dict=True,
-                labels=targets,
-            )
+        outputs = self.opt_model(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            return_dict=True,
+            labels=targets,
+        )
         loss = outputs.loss
 
         return {"loss": loss}
@@ -189,94 +236,62 @@ class Blip2OPT(Blip2Base):
         Returns:
             captions (list): A list of strings of length batch_size * num_captions.
         """
-        image = samples["image"]
-        with self.maybe_autocast():
-            image_embeds = self.ln_vision(self.visual_encoder(image))
-            image_atts = torch.ones(image_embeds.size()[:-1], dtype=torch.long).to(
-                image.device
-            )
+        speech = samples["source"]
+        speech_embeds, codes = self.speech_encoder.forward_feature(speech.unsqueeze(1), [0])
+        speech_embeds = self.ln_speech(speech_embeds[0].transpose(1, 2))
 
-            query_tokens = self.query_tokens.expand(image_embeds.shape[0], -1, -1)
-            query_output = self.Qformer.bert(
-                query_embeds=query_tokens,
-                encoder_hidden_states=image_embeds,
-                encoder_attention_mask=image_atts,
-                return_dict=True,
-            )
+        speech_atts = codes[0] != self.speechtokenizer_padding_idx
 
-            inputs_opt = self.opt_proj(query_output.last_hidden_state)
-            atts_opt = torch.ones(inputs_opt.size()[:-1], dtype=torch.long).to(
-                image.device
-            )
 
-            if "prompt" in samples.keys():
-                prompt = samples["prompt"]
-            else:
-                prompt = self.prompt
+        query_tokens = self.query_tokens.expand(speech_embeds.shape[0], -1, -1)
+        query_output = self.Qformer.bert(
+            query_embeds=query_tokens,
+            encoder_hidden_states=speech_embeds,
+            encoder_attention_mask=speech_atts,
+            return_dict=True,
+        )
 
-            prompt = [prompt] * image.size(0)
+        inputs_opt = self.opt_proj(query_output.last_hidden_state)
+        atts_opt = torch.ones(inputs_opt.size()[:-1], dtype=torch.long).to(
+            speech.device
+        )
 
-            opt_tokens = self.opt_tokenizer(
-                prompt,
-                return_tensors="pt",
-                padding="longest",
-                truncation=True,
-                max_length=self.max_txt_len,
-            ).to(image.device)
-            attention_mask = torch.cat([atts_opt, opt_tokens.attention_mask], dim=1)
-            
-            # new version for transformers>=4.27
-            inputs_embeds = self.opt_model.get_input_embeddings()(opt_tokens.input_ids)
-            inputs_embeds = torch.cat([inputs_opt,inputs_embeds],dim=1)
-            
-            outputs = self.opt_model.generate(
-                inputs_embeds=inputs_embeds, 
-                attention_mask=attention_mask,
-                do_sample=use_nucleus_sampling,
-                top_p=top_p,
-                temperature=temperature,
-                num_beams=num_beams,
-                max_length=max_length,
-                min_length=min_length,
-                eos_token_id=self.eos_token_id,
-                repetition_penalty=repetition_penalty,
-                length_penalty=length_penalty,
-                num_return_sequences=num_captions,
-            )
-            output_text = self.opt_tokenizer.batch_decode(
-                outputs, skip_special_tokens=True
-            )
-                            
-            # previous version for transformers<4.27
-            # if use_nucleus_sampling:
-            #     query_embeds = inputs_opt.repeat_interleave(num_captions, dim=0)
-            #     num_beams = 1
-            # else:
-            #     query_embeds = inputs_opt.repeat_interleave(num_beams, dim=0)
+        if "prompt" in samples.keys():
+            prompt = samples["prompt"]
+        else:
+            prompt = self.prompt
 
-            # outputs = self.opt_model.generate(
-            #     input_ids=input_ids,
-            #     query_embeds=query_embeds,
-            #     attention_mask=attention_mask,
-            #     do_sample=use_nucleus_sampling,
-            #     top_p=top_p,
-            #     temperature=temperature,
-            #     num_beams=num_beams,
-            #     max_new_tokens=max_length,
-            #     min_length=min_length,
-            #     eos_token_id=self.eos_token_id,
-            #     repetition_penalty=repetition_penalty,
-            #     length_penalty=length_penalty,
-            #     num_return_sequences=num_captions,
-            # )
+        prompt = [prompt] * speech.size(0)
 
-            # prompt_length = opt_tokens.input_ids.shape[1]
-            # output_text = self.opt_tokenizer.batch_decode(
-            #     outputs[:, prompt_length:], skip_special_tokens=True
-            # )
-            
-            output_text = [text.strip() for text in output_text]
-            return output_text
+        opt_tokens = self.opt_tokenizer(
+            prompt,
+            return_tensors="pt",
+        ).to(speech.device)
+        attention_mask = torch.cat([atts_opt, opt_tokens.attention_mask], dim=1)
+        
+        inputs_embeds = self.opt_model.get_input_embeddings()(opt_tokens.input_ids)
+        inputs_embeds = torch.cat([inputs_opt, inputs_embeds],dim=1)
+        
+        outputs = self.opt_model.generate(
+            inputs_embeds=inputs_embeds, 
+            attention_mask=attention_mask,
+            do_sample=use_nucleus_sampling,
+            top_p=top_p,
+            temperature=temperature,
+            num_beams=num_beams,
+            max_length=max_length,
+            min_length=min_length,
+            eos_token_id=self.eos_token_id,
+            repetition_penalty=repetition_penalty,
+            length_penalty=length_penalty,
+            num_return_sequences=num_captions,
+        )
+        output_text = self.opt_tokenizer.batch_decode(
+            outputs, skip_special_tokens=True
+        )
+        
+        output_text = [text.strip() for text in output_text]
+        return output_text
         
         
     def predict_answers(
@@ -423,3 +438,7 @@ class Blip2OPT(Blip2Base):
         model.load_checkpoint_from_config(cfg)
 
         return model
+
+@register_model_architecture(model_name="speech_qformer_base_opt", arch_name="speech_qformer_base_opt")
+def base_architecture(args):
+    pass

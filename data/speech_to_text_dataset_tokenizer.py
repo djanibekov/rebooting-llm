@@ -62,10 +62,14 @@ class SpeechToTextDatasetTokenizer(FairseqDataset):
         speechtokenizer_ckptpath=None
     ):
         self.speechcodes = pd.read_csv(manifest_path, sep='\t')[['speechcodes_str']]
+        loaded_samples = len(self.speechcodes)
+        logging.info(f'Loaded {loaded_samples} samples')
+        # self.speechcodes = self.speechcodes[self.speechcodes['speechcodes_str'].apply(lambda x: len(x.split(' ')) < 512)]
+        logging.info(f'Skipped {loaded_samples - len(self.speechcodes)} samples')
         self.sample_rate = sample_rate
         self.shuffle = shuffle
-        inds = list(range(len(self.speechcodes)))
-        tot = len(inds)
+        inds = self.speechcodes.index.to_list()
+        tot = loaded_samples
 
         self.num_labels = len(label_paths)
         self.store_labels = store_labels

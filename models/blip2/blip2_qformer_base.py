@@ -170,8 +170,8 @@ class Blip2QformerBase(Blip2Base):
         text_tokens = self.tokenizer(
             text, 
             padding="max_length", 
-            truncation=True, 
-            max_length=self.max_txt_len, 
+            # truncation=True, 
+            # max_length=self.max_txt_len, 
             return_tensors="pt",
         ).to(speech.device)
 
