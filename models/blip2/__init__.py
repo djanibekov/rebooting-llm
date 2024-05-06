@@ -1,7 +1,8 @@
-from .blip2_qformer_large import Blip2QformerLarge
-from .blip2_qformer_base import Blip2QformerBase
-from .blip2_qformer_tokenized import Blip2QformerTokenized
+from .blip2_qformer_large_raw import Blip2QformerLarge
+from .blip2_qformer_base_raw import Blip2QformerBase
+from .blip2_qformer_base_feats import Blip2QformerBaseFeats
 from .blip2_qformer_opt import Blip2OPT
+from .blip2_qformer_gpt import Blip2GPT
 
 from .ablation import *
 # from .ablation.oneloss.blip2_qformer_base_stm import Blip2QformerBaseSTM

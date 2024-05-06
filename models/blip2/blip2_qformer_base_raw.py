@@ -32,11 +32,11 @@ from fairseq.modules import (
 
 
 from fairseq import utils
+from transformers import AutoProcessor, AutoModel
 
 
 class LayerNorm(nn.LayerNorm):
     """Subclass torch's LayerNorm to handle fp16."""
-
     def forward(self, x: torch.Tensor):
         orig_type = x.dtype
         ret = super().forward(x)
@@ -44,18 +44,47 @@ class LayerNorm(nn.LayerNorm):
 
 @register_model("speech_qformer_base")
 class Blip2QformerBase(Blip2Base):
+    @staticmethod
+    def add_args(parser):
+        parser.add_argument("--cross-attention-freq", type=int)
+        parser.add_argument("--num-query-token", type=int)
+        parser.add_argument("--speech-model-config-path", type=str)
+        parser.add_argument("--speech-model-file-path", type=str)
+        parser.add_argument("--qformer-dim", type=str)
+        parser.add_argument("--speech-encoder-model", type=str, choices=['speechtokenizer', 'hubertbase', 'hubertlarge'])
+       
 
     @classmethod
     def build_model(cls, args, task):
         """Build a new model instance."""
         base_architecture(args)
-        speech_encoder, config = cls.build_speech_model({
-            'speech_model_file_path': args.speechtokenizer_ckptpath,
-            'speech_model_config_path': args.speechtokenizer_configpath,
-            'freeze_enc': True
-        })      
+        if args.speech_encoder_model == 'speechtokenizer':
+            speech_encoder, config = cls.build_speech_model_speechtoknenizer({
+                'speech_model_file_path': args.speechtokenizer_ckptpath,
+                'speech_model_config_path': args.speechtokenizer_configpath,
+                'freeze_enc': True
+            }) 
+            codebook_size = config['codebook_size']
+        elif args.speech_encoder_model == 'hubertbase':
+            speech_encoder, config = cls.build_speech_model_hubertbase({
+                'speech_model_file_path': args.speechtokenizer_ckptpath,
+                'speech_model_config_path': args.speechtokenizer_configpath,
+                'freeze_enc': True
+            })
+            codebook_size = config.hidden_size
+        
+        elif args.speech_encoder_model == 'hubertlarge':
+            speech_encoder, config = cls.build_speech_model_hubertlarge({
+                'speech_model_file_path': args.speechtokenizer_ckptpath,
+                'speech_model_config_path': args.speechtokenizer_configpath,
+                'freeze_enc': True
+            }) 
+            codebook_size = config.hidden_size
+        else:
+            raise NotImplemented
+
         Qformer, query_tokens, tokenizer = cls.build_qformer({
-            'codebook_size': config['codebook_size'],
+            'codebook_size': codebook_size,
             'cross_attention_freq': args.cross_attention_freq,
             'num_query_token': args.num_query_token
         })
@@ -66,11 +95,12 @@ class Blip2QformerBase(Blip2Base):
             Qformer, 
             query_tokens,
             tokenizer,
-            config
+            config,
+            codebook_size
         )
 
     @classmethod
-    def build_speech_model(cls, args, dictionary=None, embed_tokens=None):
+    def build_speech_model_speechtoknenizer(cls, args, dictionary=None, embed_tokens=None):
         speech_encoder = SpeechTokenizer.load_from_checkpoint(
             args['speech_model_config_path'], args['speech_model_file_path']
         )
@@ -86,6 +116,28 @@ class Blip2QformerBase(Blip2Base):
             speech_encoder.eval()
 
         return speech_encoder, config
+
+    @classmethod
+    def build_speech_model_hubertbase(cls, args, dictionary=None, embed_tokens=None):
+        speech_encoder = AutoModel.from_pretrained("facebook/hubert-base-ls960")
+
+        if args['freeze_enc']:
+            for name, param in speech_encoder.named_parameters():
+                param.requires_grad = False
+            speech_encoder.eval()
+
+        return speech_encoder, speech_encoder.config
+    
+    @classmethod
+    def build_speech_model_hubertlarge(cls, args, dictionary=None, embed_tokens=None):
+        speech_encoder = AutoModel.from_pretrained("facebook/hubert-large-ll60k")
+
+        if args['freeze_enc']:
+            for name, param in speech_encoder.named_parameters():
+                param.requires_grad = False
+            speech_encoder.eval()
+
+        return speech_encoder, speech_encoder.config
     
     @classmethod
     def build_qformer(cls, args):
@@ -97,14 +149,6 @@ class Blip2QformerBase(Blip2Base):
 
         return Qformer, query_tokens, tokenizer
 
-    @staticmethod
-    def add_args(parser):
-        parser.add_argument("--cross-attention-freq", type=int)
-        parser.add_argument("--num-query-token", type=int)
-        parser.add_argument("--speech-model-config-path", type=str)
-        parser.add_argument("--speech-model-file-path", type=str)
-        parser.add_argument("--qformer-dim", type=str)
-       
 
     def __init__(
         self,
@@ -114,20 +158,18 @@ class Blip2QformerBase(Blip2Base):
         query_tokens,
         tokenizer,
         speech_config,
-        drop_path_rate=0,
-        use_grad_checkpoint=False,
+        codebook_size,
         embed_dim=256,
-        max_txt_len=100,
-
     ):
         super().__init__()
+        speech_encoder.gradient_checkpointing_enable()
         self.speech_encoder = speech_encoder
         self.Qformer = Qformer
         self.query_tokens = query_tokens
         self.tokenizer = tokenizer
         self.speech_config = speech_config
 
-        self.ln_speech = LayerNorm(speech_config['codebook_size'])
+        self.ln_speech = LayerNorm(codebook_size)
 
         state_dict = self.Qformer.state_dict()
         for name, param in self.Qformer.named_parameters():
@@ -141,20 +183,32 @@ class Blip2QformerBase(Blip2Base):
         self.itm_head = nn.Linear(self.Qformer.config.hidden_size, 2)
         self.temp = nn.Parameter(0.07 * torch.ones([]))
 
-        self.max_txt_len = args.num_query_token
         self.speechtokenizer_padding_idx = 931
+        self.speech_encoder_model = args.speech_encoder_model
     
 
     def forward(self, samples):
         speech = samples["source"]
-        text = samples["target"][0]
+        text = [target_text.strip() for target_text in samples["target"][0]]
         
-        speech_embeds, codes = self.speech_encoder.forward_feature(speech.unsqueeze(1), [0])
-        speech_embeds = self.ln_speech(speech_embeds[0].transpose(1, 2))
+        if self.speech_encoder_model == 'speechtokenizer':
+            speech_embeds, codes = self.speech_encoder.forward_feature(speech.unsqueeze(1), [0])
+            speech_embeds = self.ln_speech(speech_embeds[0].transpose(1, 2))
 
-        speech_atts = codes[0] != self.speechtokenizer_padding_idx
+            speech_atts = codes[0] != self.speechtokenizer_padding_idx
+        elif self.speech_encoder_model == 'hubertbase' or self.speech_encoder_model == 'hubertlarge':
+            output = self.speech_encoder(speech, attention_mask=samples['padding_mask'])
+            speech_embeds = output.last_hidden_state
+            speech_embeds = self.ln_speech(speech_embeds)
+            
+            speech_atts = torch.ones(speech_embeds.size()[:-1], dtype=torch.long).to(
+                speech.device
+            )
+        else:
+            raise NotImplemented
+        
+        # breakpoint()
         query_tokens = self.query_tokens.expand(speech_embeds.shape[0], -1, -1)
-
         query_output = self.Qformer.bert(
             query_embeds=query_tokens,
             encoder_hidden_states=speech_embeds,
@@ -170,8 +224,6 @@ class Blip2QformerBase(Blip2Base):
         text_tokens = self.tokenizer(
             text, 
             padding="max_length", 
-            # truncation=True, 
-            # max_length=self.max_txt_len, 
             return_tensors="pt",
         ).to(speech.device)
 
@@ -181,7 +233,6 @@ class Blip2QformerBase(Blip2Base):
             return_dict=True,
         )
         text_feat = F.normalize(self.text_proj(text_output.last_hidden_state[:, 0, :]), dim=-1)
-        # breakpoint()
 
         ###============== Speech-text Contrastive ===================###
         speech_feats_all = concat_all_gather(speech_feats)
@@ -208,16 +259,15 @@ class Blip2QformerBase(Blip2Base):
             speech.device
         )
 
-
         speech_ids = samples["speech_id"].view(-1,1)
         speech_ids_all = concat_all_gather(speech_ids)
         pos_idx = torch.eq(speech_ids, speech_ids_all.t()).float()       
-        sim_targets = pos_idx / pos_idx.sum(1,keepdim=True)   
+        sim_targets = pos_idx / pos_idx.sum(1, keepdim=True)   
         sim_targets = 0.9 * sim_targets + 0.1 * torch.ones_like(sim_targets) / sim_targets.size(1)
 
-        loss_t2s = -torch.sum(F.log_softmax(sim_t2s, dim=1)*sim_targets,dim=1).mean()
-        loss_s2t = -torch.sum(F.log_softmax(sim_s2t, dim=1)*sim_targets,dim=1).mean()     
-        loss_itc = (loss_t2s+loss_s2t)/2  
+        loss_t2s = -torch.sum(F.log_softmax(sim_t2s, dim=1)*sim_targets, dim=1).mean()
+        loss_s2t = -torch.sum(F.log_softmax(sim_s2t, dim=1)*sim_targets, dim=1).mean()     
+        loss_itc = (loss_t2s+loss_s2t) / 2  
                             
         # loss_itc = (
         #     F.cross_entropy(sim_s2t, targets, label_smoothing=0.1)
@@ -288,9 +338,9 @@ class Blip2QformerBase(Blip2Base):
             return_dict=True,
         )
 
-        vl_embeddings = output_itm.last_hidden_state[:, : query_tokens_itm.size(1), :]
-        vl_output = self.itm_head(vl_embeddings)
-        logits = vl_output.mean(dim=1)
+        sl_embeddings = output_itm.last_hidden_state[:, : query_tokens_itm.size(1), :]
+        sl_output = self.itm_head(sl_embeddings)
+        logits = sl_output.mean(dim=1)
 
         itm_labels = torch.cat(
             [torch.ones(bs, dtype=torch.long), torch.zeros(2 * bs, dtype=torch.long)],
@@ -350,36 +400,52 @@ class Blip2QformerBase(Blip2Base):
             captions (list): A list of strings of length batch_size * num_captions.
         """
         speech = samples["source"]
-        codes = self.speech_encoder.encode(speech.unsqueeze(1), 1) # codes: (n_q, B, T)
-        speech_embeds = self.speech_encoder.quantizer.decode(codes).transpose(1, 2)
-        speech_embeds = self.ln_speech(speech_embeds)
-        speech_atts = torch.ones(speech_embeds.size()[:-1], dtype=torch.long).to(
-            speech.device
-        )
+        if self.speech_encoder_model == 'speechtokenizer':
+            speech_embeds, codes = self.speech_encoder.forward_feature(speech.unsqueeze(1), [0])
+            speech_embeds = self.ln_speech(speech_embeds[0].transpose(1, 2))
+
+            speech_atts = codes[0] != self.speechtokenizer_padding_idx
+        elif self.speech_encoder_model == 'hubertbase' or self.speech_encoder_model == 'hubertlarge':
+            output = self.speech_encoder(speech, attention_mask=samples['padding_mask'])
+            speech_embeds = output.last_hidden_state
+            speech_embeds = self.ln_speech(speech_embeds)
+            
+            speech_atts = torch.ones(speech_embeds.size()[:-1], dtype=torch.long).to(
+                speech.device
+            )
+        else:
+            raise NotImplemented
+
+        if not use_nucleus_sampling:
+            image_embeds = image_embeds.repeat_interleave(num_beams, dim=0)
+        else:
+            num_beams = 1
+        
         model_kwargs = {
             "encoder_hidden_states": speech_embeds,  # used in cross attention
             "encoder_attention_mask": speech_atts,  # used in cross attention
         }
 
-        # input_ids = (
-        #     torch.LongTensor(speech.size(0), 1)
-        #     .fill_(self.tokenizer.bos_token_id)
-        #     .to(speech.device)
-        # )
-        prompt = ""
+        input_ids = (
+            torch.LongTensor(speech.size(0), 1)
+            .fill_(self.tokenizer.bos_token_id)
+            .to(speech.device)
+        )
         query_tokens = self.query_tokens.expand(speech_embeds.shape[0], -1, -1)
 
-        ## No need for beam search or any sampling strategy since we just decoding query tokens
-        query_outputs = self.Qformer.bert(
+        outputs = self.Qformer.generate(
+            input_ids=input_ids,
             query_embeds=query_tokens,
-            encoder_hidden_states=speech_embeds,
-            encoder_attention_mask=speech_atts,
-            use_cache=True,
-            return_dict=True,
+            max_length=max_length,
+            min_length=min_length,
+            num_beams=num_beams,
+            do_sample=use_nucleus_sampling,
+            top_p=top_p,
+            eos_token_id=self.tokenizer.sep_token_id,
+            pad_token_id=self.tokenizer.pad_token_id,
+            **model_kwargs
         )
-        lm_outputs = self.Qformer.cls(query_outputs[0])
-        captions = self.tokenizer.batch_decode(lm_outputs, skip_special_tokens=True)
-
+        captions = self.tokenizer.batch_decode(outputs, skip_special_tokens=True)
         breakpoint()
         return captions
 
