@@ -30,7 +30,7 @@ from fairseq.modules import (
     FairseqDropout,
 )
 
-
+from transformers import GPT2Tokenizer, GPT2LMHeadModel, AutoModel, AutoTokenizer, LlamaForCausalLM
 from fairseq import utils
 
 
@@ -49,13 +49,32 @@ class Blip2QformerBaseSTCLM(Blip2Base):
     def build_model(cls, args, task):
         """Build a new model instance."""
         base_architecture(args)
-        speech_encoder, config = cls.build_speech_model({
-            'speech_model_file_path': args.speechtokenizer_ckptpath,
-            'speech_model_config_path': args.speechtokenizer_configpath,
-            'freeze_enc': True
-        })      
+        if args.speech_encoder_model == 'speechtokenizer':
+            speech_encoder, config = cls.build_speech_model_speechtoknenizer({
+                'speech_model_file_path': args.speechtokenizer_ckptpath,
+                'speech_model_config_path': args.speechtokenizer_configpath,
+                'freeze_enc': True
+            }) 
+            codebook_size = config['codebook_size']
+        elif args.speech_encoder_model == 'hubertbase':
+            speech_encoder, config = cls.build_speech_model_hubertbase({
+                'speech_model_file_path': args.speechtokenizer_ckptpath,
+                'speech_model_config_path': args.speechtokenizer_configpath,
+                'freeze_enc': True
+            })
+            codebook_size = config.hidden_size
+        
+        elif args.speech_encoder_model == 'hubertlarge':
+            speech_encoder, config = cls.build_speech_model_hubertlarge({
+                'speech_model_file_path': args.speechtokenizer_ckptpath,
+                'speech_model_config_path': args.speechtokenizer_configpath,
+                'freeze_enc': True
+            }) 
+            codebook_size = config.hidden_size
+        else:
+            raise NotImplemented      
         Qformer, query_tokens, tokenizer = cls.build_qformer({
-            'codebook_size': config['codebook_size'],
+            'codebook_size': codebook_size,
             'cross_attention_freq': args.cross_attention_freq,
             'num_query_token': args.num_query_token
         })
@@ -66,11 +85,12 @@ class Blip2QformerBaseSTCLM(Blip2Base):
             Qformer, 
             query_tokens,
             tokenizer,
-            config
+            config,
+            codebook_size
         )
 
     @classmethod
-    def build_speech_model(cls, args, dictionary=None, embed_tokens=None):
+    def build_speech_model_speechtoknenizer(cls, args, dictionary=None, embed_tokens=None):
         speech_encoder = SpeechTokenizer.load_from_checkpoint(
             args['speech_model_config_path'], args['speech_model_file_path']
         )
@@ -86,6 +106,28 @@ class Blip2QformerBaseSTCLM(Blip2Base):
             speech_encoder.eval()
 
         return speech_encoder, config
+
+    @classmethod
+    def build_speech_model_hubertbase(cls, args, dictionary=None, embed_tokens=None):
+        speech_encoder = AutoModel.from_pretrained("facebook/hubert-base-ls960")
+
+        if args['freeze_enc']:
+            for name, param in speech_encoder.named_parameters():
+                param.requires_grad = False
+            speech_encoder.eval()
+
+        return speech_encoder, speech_encoder.config
+    
+    @classmethod
+    def build_speech_model_hubertlarge(cls, args, dictionary=None, embed_tokens=None):
+        speech_encoder = AutoModel.from_pretrained("facebook/hubert-large-ll60k")
+
+        if args['freeze_enc']:
+            for name, param in speech_encoder.named_parameters():
+                param.requires_grad = False
+            speech_encoder.eval()
+
+        return speech_encoder, speech_encoder.config
     
     @classmethod
     def build_qformer(cls, args):
@@ -104,6 +146,7 @@ class Blip2QformerBaseSTCLM(Blip2Base):
         parser.add_argument("--speech-model-config-path", type=str)
         parser.add_argument("--speech-model-file-path", type=str)
         parser.add_argument("--qformer-dim", type=str)
+        parser.add_argument("--speech-encoder-model", type=str, choices=['speechtokenizer', 'hubertbase', 'hubertlarge'])
        
 
     def __init__(
@@ -114,6 +157,7 @@ class Blip2QformerBaseSTCLM(Blip2Base):
         query_tokens,
         tokenizer,
         speech_config,
+        codebook_size,
         drop_path_rate=0,
         use_grad_checkpoint=False,
         embed_dim=256,
@@ -126,7 +170,8 @@ class Blip2QformerBaseSTCLM(Blip2Base):
         self.tokenizer = tokenizer
         self.speech_config = speech_config
 
-        self.ln_speech = LayerNorm(speech_config['codebook_size'])
+        self.ln_speech = LayerNorm(codebook_size)
+        self.speech_encoder_model = args.speech_encoder_model
 
         state_dict = self.Qformer.state_dict()
         for name, param in self.Qformer.named_parameters():
@@ -147,10 +192,22 @@ class Blip2QformerBaseSTCLM(Blip2Base):
         speech = samples["source"]
         text = samples["target"][0]
         
-        speech_embeds, codes = self.speech_encoder.forward_feature(speech.unsqueeze(1), [0])
-        speech_embeds = self.ln_speech(speech_embeds[0].transpose(1, 2))
+        if self.speech_encoder_model == 'speechtokenizer':
+            speech_embeds, codes = self.speech_encoder.forward_feature(speech.unsqueeze(1), [0])
+            speech_embeds = self.ln_speech(speech_embeds[0].transpose(1, 2))
 
-        speech_atts = codes[0] != self.speechtokenizer_padding_idx
+            speech_atts = codes[0] != self.speechtokenizer_padding_idx
+        elif self.speech_encoder_model == 'hubertbase' or self.speech_encoder_model == 'hubertlarge':
+            output = self.speech_encoder(speech, attention_mask=samples['padding_mask'])
+            speech_embeds = output.last_hidden_state
+            speech_embeds = self.ln_speech(speech_embeds)
+            
+            speech_atts = torch.ones(speech_embeds.size()[:-1], dtype=torch.long).to(
+                speech.device
+            )
+        else:
+            raise NotImplemented
+
         query_tokens = self.query_tokens.expand(speech_embeds.shape[0], -1, -1)
 
         query_output = self.Qformer.bert(

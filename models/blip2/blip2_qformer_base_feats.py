@@ -33,6 +33,7 @@ from fairseq.modules import (
 
 from fairseq import utils
 from transformers import AutoProcessor, AutoModel
+from .rmsnorm import RMSNorm
 
 
 class LayerNorm(nn.LayerNorm):
@@ -115,7 +116,11 @@ class Blip2QformerBaseFeats(Blip2Base):
         self.speech_encoder_model = args.speech_encoder_model
 
         self.speech_embeddings = nn.Embedding(args.speech_vocab_size + 1, self.Qformer.config.hidden_size)
-    
+        self.embedding_norm = RMSNorm(self.Qformer.config.hidden_size)
+        
+        rope_theta = 500000.0
+        zero_to_one_split_into_parts = torch.tensor(range(self.Qformer.config.hidden_size // 2)) / (self.Qformer.config.hidden_size // 2)
+        self.freqs = 1.0 / (rope_theta ** zero_to_one_split_into_parts)
 
     def forward(self, samples):
         speech = samples["source_feats"]
@@ -128,14 +133,25 @@ class Blip2QformerBaseFeats(Blip2Base):
             # speech_atts = codes[0] != self.speechtokenizer_padding_idx
             raise NotImplemented
         elif self.speech_encoder_model == 'hubertbase' or self.speech_encoder_model == 'hubertlarge':
-            speech_embeds = self.speech_embeddings(speech).to(speech.device)
+            speech_embeds = self.embedding_norm(self.speech_embeddings(speech).to(speech.device))
+            freqs_for_each_token = torch.outer(torch.arange(speech.shape[1]), self.freqs)
+            freqs_cis = torch.polar(torch.ones_like(freqs_for_each_token), freqs_for_each_token).to(speech.device)
+
+            speech_embeds_pairs = speech_embeds.float().view(speech_embeds.shape[0], speech_embeds.shape[1], -1, 2)
+            speech_embeds_pairs_complex = torch.view_as_complex(speech_embeds_pairs)
+            speech_embeds_rotated = speech_embeds_pairs_complex * freqs_cis
+            speech_embeds_rotated = torch.view_as_real(speech_embeds_rotated)
+            speech_embeds_rotated = speech_embeds_rotated.view(*speech_embeds.shape)
+
+
             speech_atts = samples['padding_mask_feats'].to(speech.device)
         else:
             raise NotImplemented
+        
         query_tokens = self.query_tokens.expand(speech_embeds.shape[0], -1, -1).to(speech.device)
         query_output = self.Qformer.bert(
             query_embeds=query_tokens,
-            encoder_hidden_states=speech_embeds,
+            encoder_hidden_states=speech_embeds_rotated,
             encoder_attention_mask=speech_atts,
             use_cache=True,
             return_dict=True,
@@ -198,80 +214,6 @@ class Blip2QformerBaseFeats(Blip2Base):
         #     + F.cross_entropy(sim_t2s, targets, label_smoothing=0.1)
         # ) / 2
 
-        ###============== Speech-text Matching ===================###
-        text_input_ids_world = concat_all_gather(text_tokens.input_ids)
-        text_attention_mask_world = concat_all_gather(text_tokens.attention_mask)
-        speech_embeds_world = all_gather_with_grad(speech_embeds)
-        
-        with torch.no_grad():
-            mask = torch.eq(speech_ids, speech_ids_all.t())
-            sim_t2s.masked_fill_(mask, -10000)
-            sim_s2t.masked_fill_(mask, -10000)     
-            
-            # sim_t2s[:, rank * bs : rank * bs + bs].fill_diagonal_(-10000)
-            # sim_s2t[:, rank * bs : rank * bs + bs].fill_diagonal_(-10000)
-                
-            weights_t2s = F.softmax(sim_t2s, dim=1)
-            weights_s2t = F.softmax(sim_s2t, dim=1)
-
-        # select a negative speech for each text
-        speech_embeds_neg = []
-        for b in range(bs):
-            neg_idx = torch.multinomial(weights_t2s[b], 1).item()
-            speech_embeds_neg.append(speech_embeds_world[neg_idx])
-        speech_embeds_neg = torch.stack(speech_embeds_neg, dim=0)
-
-        # select a negative text for each speech
-        text_ids_neg = []
-        text_atts_neg = []
-        for b in range(bs):
-            neg_idx = torch.multinomial(weights_s2t[b], 1).item()
-            text_ids_neg.append(text_input_ids_world[neg_idx])
-            text_atts_neg.append(text_attention_mask_world[neg_idx])
-
-        text_ids_neg = torch.stack(text_ids_neg, dim=0)
-        text_atts_neg = torch.stack(text_atts_neg, dim=0)
-
-        text_ids_all = torch.cat(
-            [text_tokens.input_ids, text_tokens.input_ids, text_ids_neg], dim=0
-        )  # pos, pos, neg
-        text_atts_all = torch.cat(
-            [text_tokens.attention_mask, text_tokens.attention_mask, text_atts_neg],
-            dim=0,
-        )
-
-        query_tokens_itm = self.query_tokens.expand(text_ids_all.shape[0], -1, -1)
-        query_atts_itm = torch.ones(query_tokens_itm.size()[:-1], dtype=torch.long).to(
-            speech.device
-        )
-        attention_mask_all = torch.cat([query_atts_itm, text_atts_all], dim=1)
-
-        speech_embeds_all = torch.cat(
-            [speech_embeds, speech_embeds_neg, speech_embeds], dim=0
-        )  # pos, neg, pos
-        speech_atts_all = torch.ones(speech_embeds_all.size()[:-1], dtype=torch.long).to(
-            speech.device
-        )
-
-        output_itm = self.Qformer.bert(
-            text_ids_all,
-            query_embeds=query_tokens_itm,
-            attention_mask=attention_mask_all,
-            encoder_hidden_states=speech_embeds_all,
-            encoder_attention_mask=speech_atts_all,
-            return_dict=True,
-        )
-
-        sl_embeddings = output_itm.last_hidden_state[:, : query_tokens_itm.size(1), :]
-        sl_output = self.itm_head(sl_embeddings)
-        logits = sl_output.mean(dim=1)
-
-        itm_labels = torch.cat(
-            [torch.ones(bs, dtype=torch.long), torch.zeros(2 * bs, dtype=torch.long)],
-            dim=0,
-        ).to(speech.device)
-        loss_itm = F.cross_entropy(logits, itm_labels)
-
         ##================= Transcription Generation  ========================##
         decoder_input_ids = text_tokens.input_ids.clone()
         decoder_input_ids[:, 0] = self.tokenizer.bos_token_id
@@ -292,9 +234,9 @@ class Blip2QformerBaseFeats(Blip2Base):
         loss_lm = lm_output.loss
         
         return BlipOutput(
-            loss=loss_itc + loss_itm + loss_lm,
+            loss=loss_itc + loss_lm,
             loss_itc=loss_itc,
-            loss_itm=loss_itm,
+            loss_itm=None,
             loss_lm=loss_lm,
         )
 

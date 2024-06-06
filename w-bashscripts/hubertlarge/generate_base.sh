@@ -1,9 +1,9 @@
-CHECKPOINT_PATH=/l/users/amirbek.djanibekov/master-thesis/models/adapters/speechqformer_fairseq/checkpoints/hubertlarge/pretrain_tristage/checkpoint_best.pt
+CHECKPOINT_PATH=/l/users/amirbek.djanibekov/master-thesis/models/adapters/speechqformer_fairseq/checkpoints/hubertlarge/pretrain_gpt/checkpoint_best.pt
 DATA_ROOT=/l/users/amirbek.djanibekov/master-thesis/models/adapters/speechqformer_fairseq/_data
-SUBSET="fairseq_speech_test_librispeech|fairseq_text_test_librispeech"
+SUBSET="fairseq_speech_dev_librispeech|fairseq_text_dev_librispeech"
 USER_DIR=/l/users/amirbek.djanibekov/master-thesis/models/adapters/speechqformer_fairseq
-BEAM=10
-MAX_TOKENS=3000000
+BEAM=35
+MAX_TOKENS=30000000
 
 fairseq-generate ${DATA_ROOT} \
   --gen-subset ${SUBSET} \
