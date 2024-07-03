@@ -3,9 +3,7 @@ __pycache__
 */*/__pycache__
 */*/*/__pycache__
 
-_data
-_savedir
-_checkpoints*/
+_*
 logs/
 
 checkpoints*
