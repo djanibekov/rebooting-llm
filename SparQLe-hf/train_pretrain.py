@@ -1,7 +1,9 @@
 import os
 import torch
+import string
 import torch.nn as nn
 import numpy as np
+import soundfile as sf
 
 from torch.utils.data import Dataset
 from torch.nn.utils.rnn import pad_sequence
@@ -9,7 +11,7 @@ from torch.nn.utils.rnn import pad_sequence
 from dataset import CustomDataset
 from dataset_fairseq import CustomDataset
 
-from torch.utils.data import ConcatDatasetd
+from torch.utils.data import ConcatDataset
 
 from transformers import AutoTokenizer, AutoModel, Wav2Vec2FeatureExtractor
 from qformer import BertConfig, BertLMHeadModel
@@ -39,6 +41,9 @@ from loguru import logger
 MAXDURARION=30
 SAMPLINGRATE=16000
 QFORMERBASE = 'google-bert/bert-base-multilingual-uncased'
+# QFORMERBASE = 'google-bert/bert-large-uncased'
+
+PREVLOSS = None
 
 
 def _rampup_factor(epoch, iters, num_iters_per_epoch):
@@ -71,6 +76,7 @@ class DataCollatorWithPadding:
     def __call__(
         self, features: List[Dict[str, Union[List[int], torch.Tensor]]]
     ) -> Dict[str, torch.Tensor]:
+        
         input_data = [item['input'] for item in features]
         source_labels_data = [item['source_labels']['input_ids'].squeeze() for item in features]
         target_labels_data = [item['target_labels']['input_ids'].squeeze() for item in features]
@@ -81,6 +87,9 @@ class DataCollatorWithPadding:
         
         source_attention_mask = (padded_source_labels != self.text_pad_int).long()
         target_attention_mask = (padded_target_labels != self.text_pad_int).long()
+
+        filepaths = [item['filepath'] for item in features]
+        idxs = [item['idx'] for item in features]
         
         return {
             'speech_inputs': torch.stack(input_data).squeeze(),
@@ -89,7 +98,9 @@ class DataCollatorWithPadding:
             'source_labels_attention_mask': source_attention_mask,
             'target_labels': padded_target_labels,
             'target_labels_attention_mask': target_attention_mask,
-            'steps_per_epoch': self.steps_per_epoch
+            'steps_per_epoch': self.steps_per_epoch,
+            'filepaths': filepaths,
+            'idxs': idxs
         }
 
 class CurriculumDataset(Dataset):
@@ -97,22 +108,49 @@ class CurriculumDataset(Dataset):
         self.data = data        
         self.texttokenizer = TextPrenet()
         self.speechtokenizer = SpeechPrenet(sampling_rate=sampling_rate, feature_extractor=feature_extractor)
+
+        self.translator = str.maketrans('', '', string.punctuation)
         
     def __len__(self):
         return len(self.data)
     
     def __getitem__(self, idx):
-        input_data, input_attention_mask = self.speechtokenizer.pre_process(self.data[idx][0].squeeze())
-        input_data, input_attention_mask = self.speechtokenizer.post_process(input_data, input_attention_mask)
-        source_labels = self.texttokenizer(self.data[idx][2].lower())
-        target_labels = self.texttokenizer(self.data[idx][2].lower())
+        target_lang = self.data[idx]['target_lang']
+        input_data, input_attention_mask = self.speechtokenizer.pre_process(self.data[idx]['audio']['array'].squeeze())
+        # audio, sr = sf.read(self.data[idx]['audio_path'])
+        # assert sr == 16000
+        # input_data, input_attention_mask = self.speechtokenizer.pre_process(audio)
+        source_text = self.data[idx]['sentence'].lower().translate(self.translator)
+        target_text = self.data[idx]['translation'].lower().translate(self.translator)
+
+        source_labels = self.texttokenizer(source_text)
+        target_labels = self.texttokenizer(target_text)
         
         return {
             'input': input_data,
             'attention_mask': input_attention_mask,
             'source_labels': source_labels,
             'target_labels': target_labels,
+            'target_lang': target_lang,
+            'source_text': source_text,
+            'target_text': target_text,
+            'filepath': self.data[idx]['audio'],
+            # 'filepath': self.data[idx]['audio_path'],
+            'idx': idx
         }
+    
+    # def __getitem__(self, idx):
+    #     input_data, input_attention_mask = self.speechtokenizer.pre_process(self.data[idx][0].squeeze())
+    #     input_data, input_attention_mask = self.speechtokenizer.post_process(input_data, input_attention_mask)
+    #     source_labels = self.texttokenizer(self.data[idx][2].lower())
+    #     target_labels = self.texttokenizer(self.data[idx][2].lower())
+        
+    #     return {
+    #         'input': input_data,
+    #         'attention_mask': input_attention_mask,
+    #         'source_labels': source_labels,
+    #         'target_labels': target_labels,
+    #     }
 
 
 class TextPrenet(nn.Module):
@@ -344,18 +382,25 @@ class SparQLePreTrain(nn.Module):
         self.stm_head = nn.Linear(self.Qformer.config.hidden_size, 2)
 
         self.temp = nn.Parameter(0.07 * torch.ones([]))
-        self.alpha = 0.4
+        self.alpha = 0.8
         self.current_epoch = None
         self.current_iter = None
 
         self.loss_domain = torch.nn.NLLLoss()
+        # self.domain_classifier = nn.Sequential([
+        #     nn.Linear(config.bottleneck_dim, 100),
+        #     nn.BatchNorm1d(100),
+        #     nn.ReLU(True),
+        #     nn.Linear(100, 2),
+        #     nn.LogSoftmax(dim=-1)
+        # ])
         self.domain_classifier = nn.Sequential()
         self.domain_classifier.add_module('d_fc1', nn.Linear(config.bottleneck_dim, 100))
         self.domain_classifier.add_module('d_bn1', nn.BatchNorm1d(100))
         self.domain_classifier.add_module('d_relu1', nn.ReLU(True))
         self.domain_classifier.add_module('d_fc2', nn.Linear(100, 2))  # english vs all
         self.domain_classifier.add_module('d_softmax', nn.LogSoftmax(dim=-1))
-        
+
         
     def forward(
             self, 
@@ -366,13 +411,9 @@ class SparQLePreTrain(nn.Module):
             target_labels, 
             target_labels_attention_mask,
             steps_per_epoch,
-            normalize=False
+            normalize=False,
+            **kwargs
         ):
-        # alpha = self.alpha * _rampup_factor(
-        #     epoch=self.current_epoch,
-        #     iters=self.current_iter,
-        #     num_iters_per_epoch=math.ceil(steps_per_epoch),
-        # )
         
         outputs = self.speech_encoder(speech_inputs, attention_mask=inputs_attention_mask)
         speech_embeds = self.speech_proj_adapter(outputs.last_hidden_state)
@@ -402,10 +443,12 @@ class SparQLePreTrain(nn.Module):
         ###============== Speech-text Contrastive ===================###
         speech_feats_all = speech_feats
         text_feat_all = text_feat
+        bs = speech_inputs.size(0)
 
         sim_q2t = torch.matmul(
             speech_feats.unsqueeze(1), text_feat_all.unsqueeze(-1)
-        ).squeeze()
+        ).squeeze(dim=(1, 3))
+       
         sim_s2t, _ = sim_q2t.max(-1)
         sim_s2t = sim_s2t / self.temp
 
@@ -416,31 +459,39 @@ class SparQLePreTrain(nn.Module):
         sim_t2s, _ = sim_t2q.max(-1)
         sim_t2s = sim_t2s / self.temp
 
-        bs = speech_inputs.size(0)
-        targets = torch.linspace(0, bs - 1, bs, dtype=int).to(speech_inputs.device)
         
+        targets = torch.linspace(0, bs - 1, bs, dtype=int).to(speech_inputs.device)
         loss_stc = (
             F.cross_entropy(sim_s2t, targets, label_smoothing=0.1)
             + F.cross_entropy(sim_t2s, targets, label_smoothing=0.1)
         ) / 2
 
-        ###============== Multilingual-text Matching ===================###
-        # source_domain_label = torch.zeros(bs)
-        # source_domain_label = Variable(source_domain_label.long().to(speech_inputs.device))
-        # source_domain_output = self.domain_classifier(text_feat)
-        # source_domain_loss = self.loss_domain(source_domain_output, source_domain_label)
+        ###============== Adversarial-text Matching ===================###
 
-        # target_domain_label = torch.ones(bs)
-        # target_domain_label = Variable(target_domain_label.long().to(speech_inputs.device)) 
+        alpha = self.alpha * _rampup_factor(
+            epoch=self.current_epoch,
+            iters=self.current_iter,
+            num_iters_per_epoch=math.ceil(steps_per_epoch),
+        )
 
-        # target_domain_text_output = self.Qformer.bert(target_labels, attention_mask=target_labels_attention_mask, return_dict=True,)
-        # target_domain_text_feat = F.normalize(self.text_proj(target_domain_text_output.last_hidden_state[:, 0, :]), dim=-1)
-        # reverse_feature = ReverseLayerF.apply(target_domain_text_feat, alpha)
+        source_domain_label = torch.zeros(bs)
+        source_domain_label = Variable(source_domain_label.long().to(speech_inputs.device))
+        source_domain_output = self.domain_classifier(text_feat)
+        source_domain_loss = self.loss_domain(source_domain_output, source_domain_label)
 
-        # target_domain_output = self.domain_classifier(reverse_feature)
-        # target_domain_loss = self.loss_domain(target_domain_output, target_domain_label)
+        target_domain_label = torch.ones(bs)
+        target_domain_label = Variable(target_domain_label.long().to(speech_inputs.device)) 
+
+        target_domain_text_output = self.Qformer.bert(target_labels, attention_mask=target_labels_attention_mask, return_dict=True,)
+        target_domain_text_feat = F.normalize(self.text_proj(target_domain_text_output.last_hidden_state[:, 0, :]), dim=-1)
+        reverse_feature = ReverseLayerF.apply(target_domain_text_feat, alpha)
+
+        target_domain_output = self.domain_classifier(reverse_feature)
+        target_domain_loss = self.loss_domain(target_domain_output, target_domain_label)
         
-        # loss_stm = source_domain_loss + target_domain_loss
+        loss_adv = source_domain_loss + target_domain_loss
+
+        ###============== Multilingual-text Matching ===================###
 
         text_input_ids_world = source_labels
         text_attention_mask_world = source_labels_attention_mask
@@ -524,10 +575,11 @@ class SparQLePreTrain(nn.Module):
 
         loss_lm = lm_output.loss
 
+        # logger.info(f"loss: {loss_stc + loss_stm + loss_lm}, loss_stc: {loss_stc}, loss_stm: {loss_stm}, loss_lm: {loss_lm}, loss_adv: {loss_adv}", loss_stc=loss_stc, loss_stm=loss_stm, loss_lm=loss_lm, loss_adv=loss_adv)
         logger.info(f"loss: {loss_stc + loss_stm + loss_lm}, loss_stc: {loss_stc}, loss_stm: {loss_stm}, loss_lm: {loss_lm}", loss_stc=loss_stc, loss_stm=loss_stm, loss_lm=loss_lm)
 
         return BlipOutput(
-            loss=loss_stc + loss_stm + loss_lm,
+            loss=loss_stc + loss_stm + loss_lm, #+ loss_adv,
             loss_stc=loss_stc,
             loss_stm=loss_stm,
             loss_lm=loss_lm,
@@ -625,15 +677,80 @@ def load_iwslt(framework):
 
     return train_dataset, val_dataset
            
+def covostdataset():
+    from datasets import load_dataset
+    LANGDICT = {
+        'en_de': 'german',
+        'en_fr': 'french',
+        'en_tr': 'turkish'
+    }
+    def add_lang(example, lang):
+        example['target_lang'] = lang
+        return example
+    
+    train_datasets = []
+    val_datasets = []
+    langs = os.environ['LANGS'].split()
+    for lang in langs:
+        
+        dataset = load_dataset(
+            'facebook/covost2', 
+            lang,
+            data_dir=os.environ['DATADIR'],
+            cache_dir=os.environ['CACHE'], 
+            trust_remote_code=True
+        )
+        print(f"Loaded {lang} train with {len(dataset['train'])} examples")
+        
+        dataset['train'] = dataset['train'].map(add_lang, fn_kwargs={'lang': LANGDICT[lang]})
+        dataset['validation'] = dataset['validation'].map(add_lang, fn_kwargs={'lang': LANGDICT[lang]})
+
+        corrupted_ids = [
+            218745, 218746, 218747, 218748, 218749, 218750, 218751, 218752, 218753, 218754, 218755, 218756, 218757, 218758, 218759, 218760, 218762,
+            33561, 
+
+            46770, 77652, 128308, 227092
+        ]
+
+        train_size = len(dataset['train'])
+        valid_indices = [i for i in range(train_size) if i not in corrupted_ids]
+
+        # Select only the valid indices
+        dataset['train'] = dataset['train'].select(valid_indices)
+        
+        train_datasets.append(dataset['train'])
+        val_datasets.append(dataset['validation'])
+
+    return ConcatDataset(train_datasets), ConcatDataset(val_datasets)
+
+
+def ldc_tunisian_english():
+    from datasets import load_from_disk
+
+    def add_lang(example, lang):
+        example['target_lang'] = lang
+        return example
+    
+    dataset = load_from_disk(
+        os.environ['DATADIR'],
+    )
+    print(f"Loaded train with {len(dataset['train'])} examples")
+    dataset['train'] = dataset['train'].map(add_lang, fn_kwargs={'lang': 'english'})
+    dataset['dev'] = dataset['dev'].map(add_lang, fn_kwargs={'lang': 'english'})
+        
+    return dataset['train'], dataset['dev']
 
 
 def main():
     BATCHSIZE = 16
     GRADIENT_ACCUMULATION = 1
-    framework = 'whisper'
+    framework = os.environ['FRAMEWORK']
     # train_dataset, val_dataset = loadiwslt(framework)
     # train_dataset, val_dataset = loadlibrispeech(framework)
-    train_dataset, val_dataset = load_iwslt(framework)
+    train_dataset, val_dataset = covostdataset()
+
+    train_dataset = CurriculumDataset(train_dataset, SAMPLINGRATE, feature_extractor=framework)
+    val_dataset = CurriculumDataset(val_dataset, SAMPLINGRATE, feature_extractor=framework)
     
     config_model = Config(
         hidden_size=768,
@@ -650,22 +767,22 @@ def main():
         per_device_train_batch_size=BATCHSIZE,
         per_device_eval_batch_size=BATCHSIZE,
         evaluation_strategy="steps",
-        eval_steps=1_000,
+        eval_steps=1000,
         logging_steps=10,
         gradient_accumulation_steps=GRADIENT_ACCUMULATION,
-        num_train_epochs=100,
+        num_train_epochs=10,
         weight_decay=0.1,
-        warmup_steps=5_000,
+        warmup_steps=1000,
         lr_scheduler_type="cosine",
-        learning_rate=1e-4,
-        save_steps=5_000,
-        fp16=True,
+        learning_rate=5e-5,
+        save_steps=1000,
+        # fp16=True,
         push_to_hub=False,
         report_to=['tensorboard'],
         remove_unused_columns=False,
         save_safetensors=False,
 
-        dataloader_num_workers=8,
+        dataloader_num_workers=4,
         dataloader_pin_memory=True,  # Enables faster data transfer to GPU
         load_best_model_at_end=True,
     )
