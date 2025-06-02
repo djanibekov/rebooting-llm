@@ -114,8 +114,7 @@ def load_audio(manifest_path, max_keep, min_keep):
                 n_long += 1
             else:
                 names.append(items[0])
-                # tasks.append(items[2])
-                tasks.append('transcription')
+                tasks.append(items[2])
                 inds.append(ind)
                 sizes.append(sz)
     tot = ind + 1

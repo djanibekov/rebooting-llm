@@ -2,3 +2,13 @@ __pycache__
 */__pycache__
 */*/__pycache__
 */*/*/__pycache__
+
+*.pyc
+checkpoints
+outputs
+.cache
+logs
+
+w-bashscripts
+presentation.pdf
+slurm*

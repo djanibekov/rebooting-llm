@@ -8,7 +8,7 @@ import torch.nn as nn
 from fairseq.models import register_model, register_model_architecture
 
 from models.sparqle.utils import SparQLeBase, disabled_train
-from transformers import AutoModel, AutoTokenizer
+from transformers import AutoModel, AutoTokenizer, LlamaForCausalLM
 
 # from models.speechtokenizer.model import SpeechTokenizer
 
@@ -24,19 +24,12 @@ class LayerNorm(nn.LayerNorm):
         ret = super().forward(x)
         return ret.type(orig_type)
 
-@register_model("sparqle_finetune_llm_instruct")
+@register_model("speech_qformer_base_llama_instruct")
 class SparQLeLLMInstruct(SparQLeBase):
     @classmethod
     def build_model(cls, args, task):
         """Build a new model instance."""
         base_architecture(args)
-        # if args.speech_encoder_model == 'speechtokenizer':
-        #     speech_encoder, config = cls.build_speech_model_speechtoknenizer({
-        #         'speech_model_file_path': args.speechtokenizer_ckptpath,
-        #         'speech_model_config_path': args.speechtokenizer_configpath,
-        #         'freeze_enc': True
-        #     }) 
-        #     codebook_size = config['codebook_size']
         if args.speech_encoder_model == 'hubertbase':
             speech_encoder, config = cls.build_speech_model_hubertbase({
                 'speech_model_file_path': args.speechtokenizer_ckptpath,
@@ -62,12 +55,10 @@ class SparQLeLLMInstruct(SparQLeBase):
 
         return cls(
             args,
-            speech_encoder,
-            Qformer, 
-            query_tokens,
-            tokenizer,
-            config,
-            codebook_size
+            speech_encoder=speech_encoder,
+            Qformer=Qformer, 
+            query_tokens=query_tokens,
+            codebook_size=codebook_size
         )
 
     # @classmethod
@@ -140,7 +131,7 @@ class SparQLeLLMInstruct(SparQLeBase):
         query_tokens,
         codebook_size,
         freeze_encoder=True,
-        prompt=""
+        training=False
     ):
         super().__init__()
         self.speech_encoder_model = args.speech_encoder_model
@@ -163,31 +154,28 @@ class SparQLeLLMInstruct(SparQLeBase):
             layer.output = None
             layer.intermediate = None
 
-        self.llm_tokenizer = AutoTokenizer.from_pretrained(args.llm_model, use_fast=False, token=os.environ['HF_TOKEN'])
+        self.llm_tokenizer = AutoTokenizer.from_pretrained(args.llama_model, use_fast=False, token=os.environ['HF_TOKEN'])
         if self.llm_tokenizer.pad_token is None:
             self.llm_tokenizer.pad_token = self.llm_tokenizer.eos_token
-        self.llm_model = AutoModel.from_pretrained(args.llm_model, cache_dir=os.environ['CACHE'], token=os.environ['HF_TOKEN'])
+        self.llama_model = LlamaForCausalLM.from_pretrained(args.llama_model, cache_dir=os.environ['CACHE'], token=os.environ['HF_TOKEN'])
         
         
-        for name, param in self.llm_model.named_parameters():
+        for name, param in self.llama_model.named_parameters():
             param.requires_grad = False
 
         self.eos_token_id = self.llm_tokenizer("\n", add_special_tokens=False).input_ids[0]
-        self.llm_proj = nn.Linear(
-            self.Qformer.config.hidden_size, self.llm_model.config.hidden_size
+        self.llama_proj = nn.Linear(
+            self.Qformer.config.hidden_size, self.llama_model.config.hidden_size
         )
 
-        # self.speechtokenizer_padding_idx = 931
+        if training:
+            checkpoint = torch.load(args.pretrained, map_location="cpu")
+            state_dict = checkpoint["model"]
 
-        checkpoint = torch.load(args.pretrained, map_location="cpu")
-        state_dict = checkpoint["model"]
+            self.load_state_dict(state_dict, strict=False)
 
-        self.load_state_dict(state_dict, strict=False)
-
-        # logging.info("Missing keys {}".format(msg.missing_keys))
-        logging.info("load checkpoint from %s" % args.pretrained)
-
-
+            # logging.info("Missing keys {}".format(msg.missing_keys))
+            logging.info("load checkpoint from %s" % args.pretrained)
 
         self.prompts = {
             "transcription": [
@@ -208,16 +196,16 @@ class SparQLeLLMInstruct(SparQLeBase):
                 # "<Speech><SpeechHere></Speech> Recognize the speech and give me the transcription.",
             ],
             "translation": [
-                "<Speech><SpeechHere></Speech> Can you translate the speech into French?",
-                "<Speech><SpeechHere></Speech> Please translate the speech you heard into French.",
-                "<Speech><SpeechHere></Speech> Listen to the speech and translate it into French.",
-                "<Speech><SpeechHere></Speech> Give me the French translation of this speech.",
-                # "<Speech><SpeechHere></Speech> Could you please provide a French translation for the speech?",
-                # "<Speech><SpeechHere></Speech> Would you be willing to translate the speech into French for me?",
-                # "<Speech><SpeechHere></Speech> Would you be able to render the speech in French?",
-                # "<Speech><SpeechHere></Speech> Could you assist me in translating the speech into French?",
-                # "<Speech><SpeechHere></Speech> Can you help me convert the speech into French text?",
-                # "<Speech><SpeechHere></Speech> Please convert the speech into French text.",
+                "<Speech><SpeechHere></Speech> Can you translate the speech into TARGETLANG?",
+                "<Speech><SpeechHere></Speech> Please translate the speech you heard into TARGETLANG.",
+                "<Speech><SpeechHere></Speech> Listen to the speech and translate it into TARGETLANG.",
+                "<Speech><SpeechHere></Speech> Give me the TARGETLANG translation of this speech.",
+                # "<Speech><SpeechHere></Speech> Could you please provide a TARGETLANG translation for the speech?",
+                # "<Speech><SpeechHere></Speech> Would you be willing to translate the speech into TARGETLANG for me?",
+                # "<Speech><SpeechHere></Speech> Would you be able to render the speech in TARGETLANG?",
+                # "<Speech><SpeechHere></Speech> Could you assist me in translating the speech into TARGETLANG?",
+                # "<Speech><SpeechHere></Speech> Can you help me convert the speech into FTARGETLANGrench text?",
+                # "<Speech><SpeechHere></Speech> Please convert the speech into TARGETLANG text.",
             ]
         }
             
@@ -235,13 +223,12 @@ class SparQLeLLMInstruct(SparQLeBase):
                 p_before_tokens = self.llm_tokenizer(
                     p_before, return_tensors="pt", add_special_tokens=False
                 ).to(embeds.device)
-                p_before_embeds = self.llm_model.model.embed_tokens(p_before_tokens.input_ids)
+                p_before_embeds = self.llama_model.model.embed_tokens(p_before_tokens.input_ids)
 
-                # speech_embeds wrapped with prompts_embeds are padded to the same length here
                 p_after_tokens = self.llm_tokenizer(
                     p_after, return_tensors="pt", padding="longest", add_special_tokens=False
                 ).to(embeds.device)
-                p_after_embeds = self.llm_model.model.embed_tokens(p_after_tokens.input_ids)
+                p_after_embeds = self.llama_model.model.embed_tokens(p_after_tokens.input_ids)
 
                 wrapped_embeds = torch.cat([p_before_embeds, embeds, p_after_embeds], dim=1)
                 wrapped_atts = torch.cat([p_before_tokens.attention_mask, atts, p_after_tokens.attention_mask], dim=1)
@@ -255,8 +242,8 @@ class SparQLeLLMInstruct(SparQLeBase):
                 p_after_tokens = self.llm_tokenizer(
                     p_after, return_tensors="pt", add_special_tokens=False
                 ).to(embeds.device)
-                p_before_embeds = self.llm_model.model.embed_tokens(p_before_tokens.input_ids).expand(batch_size, -1, -1)
-                p_after_embeds = self.llm_model.model.embed_tokens(p_after_tokens.input_ids).expand(batch_size, -1, -1)
+                p_before_embeds = self.llama_model.model.embed_tokens(p_before_tokens.input_ids).expand(batch_size, -1, -1)
+                p_after_embeds = self.llama_model.model.embed_tokens(p_after_tokens.input_ids).expand(batch_size, -1, -1)
                 
                 wrapped_embeds = torch.cat([p_before_embeds, embeds, p_after_embeds], dim=1)
                 wrapped_atts = torch.cat([p_before_tokens.attention_mask, atts, p_after_tokens.attention_mask], dim=1)
@@ -296,10 +283,10 @@ class SparQLeLLMInstruct(SparQLeBase):
         self.llm_tokenizer.padding_side = "right"
         text = samples["target"][0]
         if self.prompts:
-            if True:
-                prompt = [random.choice(self.prompts[task]) for task in samples['task']]
-            else:
-                prompt = random.sample(self.prompts[task], inputs_llama_query.shape[0])
+            # if True:
+            prompt = [random.choice(self.prompts[task]) for task in samples['task']]
+            # else:
+            #     prompt = random.sample(self.prompts[task], inputs_llama_query.shape[0])
             inputs_llama, atts_llama = self.prompt_wrap(inputs_llama_query, atts_llama_query, prompt, multi_prompt=True)
 
         llama_tokens = self.llm_tokenizer(
@@ -310,23 +297,20 @@ class SparQLeLLMInstruct(SparQLeBase):
         targets = llama_tokens.input_ids.masked_fill(
             llama_tokens.input_ids == self.llm_tokenizer.pad_token_id, -100
         )
-        # empty_targets = (
-        #     torch.ones(atts_llama.size(), dtype=torch.long).to(speech.device).fill_(-100)
-        # )
         empty_targets = torch.ones([atts_llama.shape[0], atts_llama.shape[1] + 1], dtype=torch.long).to(speech.device).fill_(-100)
         targets = torch.cat([empty_targets, targets], dim=1)
         batch_size = inputs_llama_query.shape[0]
 
-        inputs_embeds = self.llm_model.model.embed_tokens(llama_tokens.input_ids)
+        inputs_embeds = self.llama_model.model.embed_tokens(llama_tokens.input_ids)
         
         bos = torch.ones([batch_size, 1],dtype=llama_tokens.input_ids.dtype,device=llama_tokens.input_ids.device,) * self.llm_tokenizer.bos_token_id
-        bos_embeds = self.llm_model.model.embed_tokens(bos)
+        bos_embeds = self.llama_model.model.embed_tokens(bos)
         atts_bos = speech_atts[:, :1]
         
         inputs_embeds = torch.cat([bos_embeds, inputs_llama, inputs_embeds], dim=1)
         attention_mask = torch.cat([atts_bos, atts_llama, llama_tokens.attention_mask], dim=1)
 
-        outputs = self.llm_model(inputs_embeds=inputs_embeds,attention_mask=attention_mask,return_dict=True,labels=targets,)
+        outputs = self.llama_model(inputs_embeds=inputs_embeds,attention_mask=attention_mask,return_dict=True,labels=targets,)
         loss = outputs.loss
 
         return {"loss": loss}
@@ -335,63 +319,133 @@ class SparQLeLLMInstruct(SparQLeBase):
     def generate(
         self,
         samples,
-        use_nucleus_sampling=False,
+        do_sample=True,
         num_beams=30,
-        max_length=100,
+        max_new_length=75,
         min_length=1,
         top_p=0.9,
         repetition_penalty=1.0,
         length_penalty=1.0,
         num_captions=1,
         temperature=1,
+        **kwargs
     ):
+        import gc
         
+        self.llama_model.eval()
+        
+        lang = 'French'
         speech = samples["source"]
+        
         if self.speech_encoder_model == 'speechtokenizer':
             speech_embeds, codes = self.speech_encoder.forward_feature(speech.unsqueeze(1), [0])
             speech_embeds = self.ln_speech(speech_embeds[0].transpose(1, 2))
-
             speech_atts = codes[0] != self.speechtokenizer_padding_idx
+            del codes
+            
         elif self.speech_encoder_model == 'hubertbase' or self.speech_encoder_model == 'hubertlarge':
             output = self.speech_encoder(speech, attention_mask=samples['padding_mask'])
             speech_embeds = output.last_hidden_state
             speech_embeds = self.ln_speech(speech_embeds)
-            
-            speech_atts = torch.ones(speech_embeds.size()[:-1], dtype=torch.long).to(
-                speech.device
-            )
+            speech_atts = torch.ones(speech_embeds.size()[:-1], dtype=torch.long).to(speech.device)
+            del output
         else:
-            raise NotImplemented
-
-        
+            raise NotImplementedError
 
         query_tokens = self.query_tokens.expand(speech_embeds.shape[0], -1, -1)
-        query_output = self.Qformer.bert(query_embeds=query_tokens,encoder_hidden_states=speech_embeds,encoder_attention_mask=speech_atts,return_dict=True,)
+        query_output = self.Qformer.bert(
+            query_embeds=query_tokens,
+            encoder_hidden_states=speech_embeds,
+            encoder_attention_mask=speech_atts,
+            return_dict=True,
+        )
+        
+        inputs_llama_query = self.llama_proj(query_output.last_hidden_state)
+        atts_llama_query = torch.ones(inputs_llama_query.size()[:-1], dtype=torch.long).to(speech.device)
+        
+        del query_tokens, query_output, speech_embeds, speech_atts
+        torch.cuda.empty_cache()
 
-        inputs = self.llm_proj(query_output.last_hidden_state)
-        atts_llm = torch.ones(inputs.size()[:-1], dtype=torch.long).to(speech.device)
+        system_prompt = 'You are a speech-to-text conversion model. Your tasks include accurately transcribing spoken language and translating audio samples as per user instructions. Please ensure clarity and precision in both transcription and translation processes.'
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": None},
+        ]
+        input_ids = self.llm_tokenizer.apply_chat_template(
+            messages, add_generation_prompt=True, return_tensors="pt"
+        ).to(speech.device)
+        
+        batch_size = inputs_llama_query.shape[0]
+        bos = torch.ones([batch_size, 1], dtype=torch.int32, device=inputs_llama_query.device) * self.llm_tokenizer.bos_token_id
+        bos_embeds = self.llama_model.model.embed_tokens(bos)
+        
+        # terminators = [
+        #     self.llm_tokenizer.eos_token_id,
+        #     self.llm_tokenizer.convert_tokens_to_ids("<|eot_id|>")
+        # ]
+        beg_input_ids1 = input_ids[:, :-6]
+        aft_input_ids1 = input_ids[:, -5:]
+        beg_embds = self.llama_model.model.embed_tokens(beg_input_ids1).to(speech.device)
+        aft_embds = self.llama_model.model.embed_tokens(aft_input_ids1).to(speech.device)
+        
+        del input_ids, beg_input_ids1, aft_input_ids1, bos
+        torch.cuda.empty_cache()
 
-        if "prompt" in samples.keys():
-            prompt = samples["prompt"]
-        else:
-            prompt = self.prompt
+        unique_tasks = set(samples['tasks'])
+        all_results = []
+        
+        for task in unique_tasks:
+            for prompt in self.prompts[task]:
+                current_inputs_llama_query = inputs_llama_query.clone()
+                current_atts_llama_query = atts_llama_query.clone()
+                
+                prompt = prompt.replace('TARGETLANG', lang)
+                current_inputs_llama_query, _ = self.prompt_wrap(
+                    current_inputs_llama_query, current_atts_llama_query, prompt
+                )
+                
+                inputs_embeds = torch.cat([
+                    bos_embeds, 
+                    beg_embds, 
+                    current_inputs_llama_query, 
+                    aft_embds
+                ], dim=1)
+                attention_mask = torch.ones(inputs_embeds.size()[:-1], dtype=torch.long).to(speech.device)
 
-        prompt = [prompt] * speech.size(0)
+                outputs = self.llama_model.generate(
+                    inputs_embeds=inputs_embeds, 
+                    attention_mask=attention_mask,
+                    do_sample=do_sample,
+                    top_p=top_p,
+                    temperature=temperature,
+                    num_beams=num_beams,
+                    max_new_tokens=max_new_length,
+                    min_length=min_length,
+                    pad_token_id=self.eos_token_id,
+                    eos_token_id=self.eos_token_id,
+                    repetition_penalty=repetition_penalty,
+                    length_penalty=length_penalty,
+                    num_return_sequences=1,
+                )
+                
+                output_text = self.llm_tokenizer.batch_decode(outputs, skip_special_tokens=True)
+                output_text = [text.strip() for text in output_text][0]
+                all_results.extend(output_text)
+                
+                print(output_text)
+                
+                del outputs, output_text, inputs_embeds, attention_mask
+                del current_inputs_llama_query, current_atts_llama_query
+                torch.cuda.empty_cache()
+                gc.collect()
+
+        del inputs_llama_query, atts_llama_query, bos_embeds, beg_embds, aft_embds
+        torch.cuda.empty_cache()
+        gc.collect()
         
-        gpt_tokens = self.llm_tokenizer(prompt,return_tensors="pt",).to(speech.device)
-        attention_mask = torch.cat([atts_llm, gpt_tokens.attention_mask], dim=1)
-        
-        inputs_embeds = self.llm_model.get_input_embeddings()(gpt_tokens.input_ids.to(torch.int)).to(speech.device)
-        inputs_embeds = torch.cat([inputs, inputs_embeds],dim=1)
-        
-        outputs = self.llm_model.generate(inputs_embeds=inputs_embeds, attention_mask=attention_mask,do_sample=use_nucleus_sampling,top_p=top_p,temperature=0.3,num_beams=num_beams,max_length=max_length,min_length=min_length,eos_token_id=self.eos_token_id,repetition_penalty=repetition_penalty,length_penalty=length_penalty,num_return_sequences=5,)
-        output_text = self.llm_tokenizer.batch_decode(outputs, skip_special_tokens=True)
-        
-        output_text = [text.strip() for text in output_text]
-        
-        return output_text
+        return all_results
         
         
-@register_model_architecture(model_name="sparqle_finetune_llm_instruct", arch_name="sparqle_finetune_llm_instruct")
+@register_model_architecture(model_name="speech_qformer_base_llama_instruct", arch_name="speech_qformer_base_llama_instruct")
 def base_architecture(args):
     pass
