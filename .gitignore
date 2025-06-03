@@ -7,8 +7,11 @@ __pycache__
 checkpoints
 outputs
 .cache
+hf_cache
 logs
 
 w-bashscripts
 presentation.pdf
 slurm*
+
+multitask_llama/*

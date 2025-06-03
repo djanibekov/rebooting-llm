@@ -1,0 +1,17 @@
+torch
+# torchaudio - Install specific version based on your PyTorch and CUDA version if needed
+# Example: torch==2.1.0 torchaudio==2.1.0 --index-url https://download.pytorch.org/whl/cu118
+# For general use / CPU:
+torchaudio
+
+transformers>=4.30.0 # Or a version compatible with Llama2 and Hubert
+gradio>=3.50.0 # Or a recent version of Gradio
+
+# Other potential dependencies (add if your Qformer.py or other parts need them beyond transformers):
+# sentencepiece # Often needed by tokenizers like Llama's
+# protobuf # Sometimes a dependency of sentencepiece or other model components
+# accelerate # For faster model loading and inference, if applicable
+
+# Ensure fairseq is NOT listed if the goal is a standalone demo without fairseq dependencies.
+# If any part of the copied code *still* implicitly requires fairseq components
+# that were not self-contained, they would need to be added or stubbed out. 
