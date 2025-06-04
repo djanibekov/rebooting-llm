@@ -91,7 +91,7 @@ class SparQLeLLMInstruct(SparQLeBase):
     def __init__(self, args): 
         super().__init__()
         self.args = args
-        self.speech_encoder_model_name = args.speech_encoder_model
+        self.speech_encoder_model = args.speech_encoder_model
         self.tokenizer = self.init_tokenizer_bert() 
 
         if args.speech_encoder_model == 'hubertbase':
@@ -226,107 +226,132 @@ class SparQLeLLMInstruct(SparQLeBase):
     @torch.no_grad()
     def generate(
         self,
-        samples, 
+        samples,
         do_sample=True,
-        num_beams=5, 
-        max_new_tokens=75, 
+        num_beams=30,
+        max_new_length=75,
         min_length=1,
         top_p=0.9,
         repetition_penalty=1.0,
         length_penalty=1.0,
-        temperature=1.0,
-        target_lang='French' 
+        num_captions=1,
+        temperature=1,
+        **kwargs
     ):
-        import gc 
+        import gc
         
-        self.llama_model.eval() 
-        self.speech_encoder.eval()
-        self.Qformer.eval()
-
-        speech = samples["source"].to(self.device)
-        padding_mask = samples.get("padding_mask", None) 
-        if padding_mask is not None:
-            padding_mask = padding_mask.to(self.device)
+        self.llama_model.eval()
         
-        current_task = samples["tasks"][0] 
-
-        if self.speech_encoder_model_name == 'hubertbase' or self.speech_encoder_model_name == 'hubertlarge':
-            if padding_mask is None:
-                 hubert_attention_mask = torch.ones_like(speech, dtype=torch.long, device=self.device)
-            else:
-                 hubert_attention_mask = (padding_mask == 0).long() 
-
-            output = self.speech_encoder(speech, attention_mask=hubert_attention_mask)
+        lang = 'Russian'
+        speech = samples["source"]
+        
+        if self.speech_encoder_model == 'speechtokenizer':
+            speech_embeds, codes = self.speech_encoder.forward_feature(speech.unsqueeze(1), [0])
+            speech_embeds = self.ln_speech(speech_embeds[0].transpose(1, 2))
+            speech_atts = codes[0] != self.speechtokenizer_padding_idx
+            del codes
+            
+        elif self.speech_encoder_model == 'hubertbase' or self.speech_encoder_model == 'hubertlarge':
+            output = self.speech_encoder(speech, attention_mask=samples['padding_mask'])
             speech_embeds = output.last_hidden_state
             speech_embeds = self.ln_speech(speech_embeds)
-            speech_atts = hubert_attention_mask 
-            if speech_atts.dim() > 2 : 
-                 speech_atts = torch.ones(speech_embeds.size()[:-1], dtype=torch.long, device=speech.device)
-
+            speech_atts = torch.ones(speech_embeds.size()[:-1], dtype=torch.long).to(speech.device)
+            del output
         else:
-            raise NotImplementedError(f"Speech encoder {self.speech_encoder_model_name} not supported in generate.")
+            raise NotImplementedError
 
         query_tokens = self.query_tokens.expand(speech_embeds.shape[0], -1, -1)
-        query_output = self.Qformer.bert( 
+        query_output = self.Qformer.bert(
             query_embeds=query_tokens,
             encoder_hidden_states=speech_embeds,
-            encoder_attention_mask=speech_atts, 
+            encoder_attention_mask=speech_atts,
             return_dict=True,
         )
+        
         inputs_llama_query = self.llama_proj(query_output.last_hidden_state)
         atts_llama_query = torch.ones(inputs_llama_query.size()[:-1], dtype=torch.long).to(speech.device)
         
-        del query_tokens, query_output, speech_embeds, speech_atts, output
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        del query_tokens, query_output, speech_embeds, speech_atts
+        torch.cuda.empty_cache()
 
-        results = []
+        system_prompt = 'You are a speech-to-text conversion model. Your tasks include accurately transcribing spoken language and translating audio samples as per user instructions. Please ensure clarity and precision in both transcription and translation processes.'
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": None},
+        ]
+        input_ids = self.llm_tokenizer.apply_chat_template(
+            messages, add_generation_prompt=True, return_tensors="pt"
+        ).to(speech.device)
         
-        prompt_template = self.prompts.get(current_task, ["<Speech><SpeechHere></Speech> Process the speech."])[0]
-        if current_task == "translation":
-            prompt = prompt_template.replace("TARGETLANG", target_lang)
-        else:
-            prompt = prompt_template
+        batch_size = inputs_llama_query.shape[0]
+        bos = torch.ones([batch_size, 1], dtype=torch.int32, device=inputs_llama_query.device) * self.llm_tokenizer.bos_token_id
+        bos_embeds = self.llama_model.model.embed_tokens(bos)
+        
+        # terminators = [
+        #     self.llm_tokenizer.eos_token_id,
+        #     self.llm_tokenizer.convert_tokens_to_ids("<|eot_id|>")
+        # ]
+        beg_input_ids1 = input_ids[:, :-6]
+        aft_input_ids1 = input_ids[:, -5:]
+        beg_embds = self.llama_model.model.embed_tokens(beg_input_ids1).to(speech.device)
+        aft_embds = self.llama_model.model.embed_tokens(aft_input_ids1).to(speech.device)
+        
+        del input_ids, beg_input_ids1, aft_input_ids1, bos
+        torch.cuda.empty_cache()
 
-        current_inputs_llama, current_atts_llama = self.prompt_wrap(
-            inputs_llama_query.clone(), atts_llama_query.clone(), prompt
-        )
+        unique_tasks = set(samples['tasks'])
+        all_results = []
         
-        inputs_embeds = current_inputs_llama
-        attention_mask = current_atts_llama
-            
-        outputs = self.llama_model.generate(
-            inputs_embeds=inputs_embeds, 
-            attention_mask=attention_mask,
-            do_sample=do_sample,
-            top_p=top_p,
-            temperature=temperature,
-            num_beams=num_beams,
-            max_new_tokens=max_new_tokens, 
-            min_length=min_length,
-            pad_token_id=self.llm_tokenizer.eos_token_id, 
-            eos_token_id=self.llm_tokenizer.eos_token_id, 
-            repetition_penalty=repetition_penalty,
-            length_penalty=length_penalty,
-            num_return_sequences=1, 
-        )
-        
-        output_text = self.llm_tokenizer.batch_decode(outputs, skip_special_tokens=True)
-        
-        processed_texts = []
-        for text in output_text:
-            cleaned_text = text.strip()
-            processed_texts.append(cleaned_text)
+        for task in unique_tasks:
+            for prompt in self.prompts[task]:
+                current_inputs_llama_query = inputs_llama_query.clone()
+                current_atts_llama_query = atts_llama_query.clone()
+                
+                prompt = prompt.replace('TARGETLANG', lang)
+                current_inputs_llama_query, _ = self.prompt_wrap(
+                    current_inputs_llama_query, current_atts_llama_query, prompt
+                )
+                
+                inputs_embeds = torch.cat([
+                    bos_embeds, 
+                    beg_embds, 
+                    current_inputs_llama_query, 
+                    aft_embds
+                ], dim=1)
+                attention_mask = torch.ones(inputs_embeds.size()[:-1], dtype=torch.long).to(speech.device)
 
-        results.extend(processed_texts)
-        
-        del outputs, inputs_embeds, attention_mask
-        del current_inputs_llama, current_atts_llama, inputs_llama_query, atts_llama_query
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+                outputs = self.llama_model.generate(
+                    inputs_embeds=inputs_embeds, 
+                    attention_mask=attention_mask,
+                    do_sample=do_sample,
+                    top_p=top_p,
+                    temperature=temperature,
+                    num_beams=num_beams,
+                    max_new_tokens=max_new_length,
+                    min_length=min_length,
+                    pad_token_id=self.eos_token_id,
+                    eos_token_id=self.eos_token_id,
+                    repetition_penalty=repetition_penalty,
+                    length_penalty=length_penalty,
+                    num_return_sequences=1,
+                )
+                
+                output_text = self.llm_tokenizer.batch_decode(outputs, skip_special_tokens=True)
+                output_text = [text.strip() for text in output_text]
+                all_results.extend(output_text)
+                
+                # print(output_text[0])
+                
+                del outputs, output_text, inputs_embeds, attention_mask
+                del current_inputs_llama_query, current_atts_llama_query
+                torch.cuda.empty_cache()
+                gc.collect()
+
+        del inputs_llama_query, atts_llama_query, bos_embeds, beg_embds, aft_embds
+        torch.cuda.empty_cache()
         gc.collect()
-        
-        return results 
+        # print('#######################################################')
+        return all_results
 
 
 # --- Audio Processing Helper ---

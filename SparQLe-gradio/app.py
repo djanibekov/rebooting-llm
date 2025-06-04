@@ -16,14 +16,20 @@ from generation import get_model_and_processor, load_and_preprocess_audio
 
 # --- Configuration (User may need to adjust these or use environment variables) ---
 SPEECH_ENCODER_MODEL = os.getenv("SPEECH_ENCODER_MODEL", "hubertlarge") # or 'hubertbase'
-NUM_QUERY_TOKEN = int(os.getenv("NUM_QUERY_TOKEN", "32"))
+NUM_QUERY_TOKEN = int(os.getenv("NUM_QUERY_TOKEN", "100"))
 CROSS_ATTENTION_FREQ = int(os.getenv("CROSS_ATTENTION_FREQ", "2"))
 LLAMA_MODEL_PATH = os.getenv("LLAMA_MODEL_PATH", "meta-llama/Meta-Llama-3-8B-Instruct")
-MODEL_CHECKPOINT_PATH = os.getenv("MODEL_CHECKPOINT_PATH", "/Users/amirbek.djanibekov/Desktop/GitHubProjects/rebooting-llm/multitask_llama/multitask_llama/checkpoint_best.pt") # IMPORTANT: Set this path or env var
+MODEL_CHECKPOINT_PATH = os.getenv("MODEL_CHECKPOINT_PATH", "/l/users/hanan.aldarmaki/training_code/SparQLe/SparQLe-fairseq-finetune/checkpoints/multitask_llama/checkpoint_last.pt") # IMPORTANT: Set this path or env var
 HF_TOKEN = os.getenv("HF_TOKEN") # Needed for gated models like Llama2
-CACHE_DIR = os.getenv("CACHE_DIR", "./hf_cache") # Cache for Hugging Face models
+CACHE_DIR = os.getenv("CACHE_DIR", "/l/users/hanan.aldarmaki/training_code/SparQLe/SparQLe-fairseq-finetune/.cache") # Cache for Hugging Face models
 HUBERT_CACHE_DIR = os.getenv("HUBERT_CACHE_DIR", os.path.join(CACHE_DIR, "hubert"))
 LLAMA_CACHE_DIR = os.getenv("LLAMA_CACHE_DIR", os.path.join(CACHE_DIR, "llama"))
+
+
+HUBERT_CACHE_DIR = CACHE_DIR
+LLAMA_CACHE_DIR = CACHE_DIR
+
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 # Create cache directories if they don't exist
 os.makedirs(HUBERT_CACHE_DIR, exist_ok=True)
@@ -79,8 +85,8 @@ def speech_to_text_action(audio_file_path, task, target_lang, num_beams, max_new
         padding_mask = torch.zeros(source_tensor.shape, dtype=torch.bool) 
 
         samples = {
-            "source": source_tensor,
-            "padding_mask": padding_mask, 
+            "source": source_tensor.to(device),
+            "padding_mask": padding_mask.to(device), 
             "tasks": [task]
         }
 
@@ -139,7 +145,7 @@ description = ("""
 Upload an audio file or use your microphone to transcribe or translate speech using the SparQLe model.
 **Note:** 
 1. Ensure `MODEL_CHECKPOINT_PATH` environment variable (or the script variable) points to your SparQLe checkpoint file (e.g., `sparqle_checkpoint.pth`).
-2. If using a gated Hugging Face model (like Llama-2), set the `HF_TOKEN` environment variable.
+2. If using a gated Hugging Face model (like Llama-3), set the `HF_TOKEN` environment variable.
 3. The first run might take longer due to model download and setup.
 4. **CRITICAL**: `Qformer.py` next to `generation.py` and `app.py` MUST be the complete version from your original codebase.
 """)

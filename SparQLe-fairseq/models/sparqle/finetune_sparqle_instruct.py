@@ -334,7 +334,7 @@ class SparQLeLLMInstruct(SparQLeBase):
         
         self.llama_model.eval()
         
-        lang = 'French'
+        lang = 'Russian'
         speech = samples["source"]
         
         if self.speech_encoder_model == 'speechtokenizer':
@@ -429,10 +429,10 @@ class SparQLeLLMInstruct(SparQLeBase):
                 )
                 
                 output_text = self.llm_tokenizer.batch_decode(outputs, skip_special_tokens=True)
-                output_text = [text.strip() for text in output_text][0]
+                output_text = [text.strip() for text in output_text]
                 all_results.extend(output_text)
                 
-                print(output_text)
+                print(output_text[0])
                 
                 del outputs, output_text, inputs_embeds, attention_mask
                 del current_inputs_llama_query, current_atts_llama_query
@@ -442,7 +442,7 @@ class SparQLeLLMInstruct(SparQLeBase):
         del inputs_llama_query, atts_llama_query, bos_embeds, beg_embds, aft_embds
         torch.cuda.empty_cache()
         gc.collect()
-        
+        print('#######################################################')
         return all_results
         
         
