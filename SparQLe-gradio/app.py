@@ -19,9 +19,9 @@ SPEECH_ENCODER_MODEL = os.getenv("SPEECH_ENCODER_MODEL", "hubertlarge") # or 'hu
 NUM_QUERY_TOKEN = int(os.getenv("NUM_QUERY_TOKEN", "100"))
 CROSS_ATTENTION_FREQ = int(os.getenv("CROSS_ATTENTION_FREQ", "2"))
 LLAMA_MODEL_PATH = os.getenv("LLAMA_MODEL_PATH", "meta-llama/Meta-Llama-3-8B-Instruct")
-MODEL_CHECKPOINT_PATH = os.getenv("MODEL_CHECKPOINT_PATH", "/l/users/hanan.aldarmaki/training_code/SparQLe/SparQLe-fairseq-finetune/checkpoints/multitask_llama/checkpoint_last.pt") # IMPORTANT: Set this path or env var
+MODEL_CHECKPOINT_PATH = os.getenv("MODEL_CHECKPOINT_PATH", None) # IMPORTANT: Set this path or env var
 HF_TOKEN = os.getenv("HF_TOKEN") # Needed for gated models like Llama2
-CACHE_DIR = os.getenv("CACHE_DIR", "/l/users/hanan.aldarmaki/training_code/SparQLe/SparQLe-fairseq-finetune/.cache") # Cache for Hugging Face models
+CACHE_DIR = os.getenv("CACHE_DIR", None) # Cache for Hugging Face models
 HUBERT_CACHE_DIR = os.getenv("HUBERT_CACHE_DIR", os.path.join(CACHE_DIR, "hubert"))
 LLAMA_CACHE_DIR = os.getenv("LLAMA_CACHE_DIR", os.path.join(CACHE_DIR, "llama"))
 
