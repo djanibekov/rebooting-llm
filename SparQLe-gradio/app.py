@@ -41,6 +41,20 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 # --- Global variable for the model ---
 model = None
 
+
+def format_prompt_response_log(data, target_lang):
+    blocks = []
+    for idx, (prompt, response) in enumerate(data.items(), 1):
+        prompt = prompt.replace('<Speech><SpeechHere></Speech> ', '').replace('TARGETLANG', target_lang)
+        block = (
+            f"==== PROMPT {idx} ====\n{prompt.strip()}\n\n"
+            f"---- RESPONSE {idx} ----\n{response.strip()}\n"
+            + "-" * 40 + "\n"
+        )
+        blocks.append(block)
+    
+    return "\n".join(blocks)
+
 def load_model_globally():
     global model
     if model is None:
@@ -92,17 +106,26 @@ def speech_to_text_action(audio_file_path, task, target_lang, num_beams, max_new
 
         # Perform generation
         with torch.no_grad():
+            logging.info(
+                f"Hyperparameters for language: {target_lang}\n\n"
+                f"num_beams={int(num_beams)},\n"
+                f"max_new_tokens={int(max_new_tokens)},\n"
+                f"temperature={float(temperature)}, \n"
+                f"top_p={top_p}, \n"
+                f"do_sample={do_sample} \n"
+            )
             generated_texts = current_model.generate(
                 samples,
                 do_sample=do_sample,
                 num_beams=int(num_beams),
-                max_new_tokens=int(max_new_tokens),
+                max_new_length=int(max_new_tokens),
                 temperature=float(temperature),
                 top_p=float(top_p),
                 target_lang=target_lang if task == "translation" else None
             )
         
-        result_text = "\n".join(generated_texts) if generated_texts else "No output generated."
+        # result_text = "\n".join(generated_texts) if generated_texts else "No output generated."
+        result_text = format_prompt_response_log(dict(zip(current_model.prompts[task], generated_texts)), target_lang)
         logging.info(f"Generated text: {result_text}")
         return result_text
 

@@ -157,9 +157,32 @@ class SparQLeLLMInstruct(SparQLeBase):
         self.prompts = {
             "transcription": [
                 "<Speech><SpeechHere></Speech> Can you transcribe the speech into a written format?",
+                "<Speech><SpeechHere></Speech> Listen to the speech and write down its content.",
+                "<Speech><SpeechHere></Speech> What is the content of the speech you heard?",
+                "<Speech><SpeechHere></Speech> Please write down the transcription of the speech.",
+                "<Speech><SpeechHere></Speech> Please transcribe the speech into a written format.",
+                "<Speech><SpeechHere></Speech> Write down the content of the speech you heard.",
+                "<Speech><SpeechHere></Speech> Can you write down the transcription of the speech?",
+                # "<Speech><SpeechHere></Speech> Put the speech into a written format.",
+                # "<Speech><SpeechHere></Speech> Please help me to transcribe the speech into a written format.",
+                # "<Speech><SpeechHere></Speech> Recognize the content of the speech you heard.",
+                # "<Speech><SpeechHere></Speech> Can you recognize what you heard in the speech?",
+                # "<Speech><SpeechHere></Speech> Recognize the speech and write it down in a written format.",
+                # "<Speech><SpeechHere></Speech> Listen to the speech and recognize its content.",
+                # "<Speech><SpeechHere></Speech> Give me the transcription of the speech you heard.",
+                # "<Speech><SpeechHere></Speech> Recognize the speech and give me the transcription.",
             ],
-            "translation": [ 
-                "<Speech><SpeechHere></Speech> Can you translate the speech into French?",
+            "translation": [
+                "<Speech><SpeechHere></Speech> Can you translate the speech into TARGETLANG?",
+                "<Speech><SpeechHere></Speech> Please translate the speech you heard into TARGETLANG.",
+                "<Speech><SpeechHere></Speech> Listen to the speech and translate it into TARGETLANG.",
+                "<Speech><SpeechHere></Speech> Give me the TARGETLANG translation of this speech.",
+                # "<Speech><SpeechHere></Speech> Could you please provide a TARGETLANG translation for the speech?",
+                # "<Speech><SpeechHere></Speech> Would you be willing to translate the speech into TARGETLANG for me?",
+                # "<Speech><SpeechHere></Speech> Would you be able to render the speech in TARGETLANG?",
+                # "<Speech><SpeechHere></Speech> Could you assist me in translating the speech into TARGETLANG?",
+                # "<Speech><SpeechHere></Speech> Can you help me convert the speech into FTARGETLANGrench text?",
+                # "<Speech><SpeechHere></Speech> Please convert the speech into TARGETLANG text.",
             ]
         }
         
@@ -236,13 +259,12 @@ class SparQLeLLMInstruct(SparQLeBase):
         length_penalty=1.0,
         num_captions=1,
         temperature=1,
+        target_lang='French',
         **kwargs
     ):
         import gc
         
         self.llama_model.eval()
-        
-        lang = 'Russian'
         speech = samples["source"]
         
         if self.speech_encoder_model == 'speechtokenizer':
@@ -307,7 +329,7 @@ class SparQLeLLMInstruct(SparQLeBase):
                 current_inputs_llama_query = inputs_llama_query.clone()
                 current_atts_llama_query = atts_llama_query.clone()
                 
-                prompt = prompt.replace('TARGETLANG', lang)
+                prompt = prompt.replace('TARGETLANG', target_lang)
                 current_inputs_llama_query, _ = self.prompt_wrap(
                     current_inputs_llama_query, current_atts_llama_query, prompt
                 )
@@ -323,9 +345,6 @@ class SparQLeLLMInstruct(SparQLeBase):
                 outputs = self.llama_model.generate(
                     inputs_embeds=inputs_embeds, 
                     attention_mask=attention_mask,
-                    do_sample=do_sample,
-                    top_p=top_p,
-                    temperature=temperature,
                     num_beams=num_beams,
                     max_new_tokens=max_new_length,
                     min_length=min_length,
@@ -334,6 +353,8 @@ class SparQLeLLMInstruct(SparQLeBase):
                     repetition_penalty=repetition_penalty,
                     length_penalty=length_penalty,
                     num_return_sequences=1,
+                    no_repeat_ngram_size=2, 
+                    early_stopping=True
                 )
                 
                 output_text = self.llm_tokenizer.batch_decode(outputs, skip_special_tokens=True)

@@ -663,7 +663,7 @@ def main():
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
     )
-    trainer.train(resume_from_checkpoint='/l/users/hanan.aldarmaki/training_code/SparQLeHF/checkpoints/[covost-random]whisper_finetune_adv_turkish/checkpoint-5000')
+    trainer.train()
     trainer.save_model(os.environ['SAVEDIR'])
 
 if __name__ == "__main__":

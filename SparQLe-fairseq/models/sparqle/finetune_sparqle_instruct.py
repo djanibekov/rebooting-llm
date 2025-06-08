@@ -328,13 +328,13 @@ class SparQLeLLMInstruct(SparQLeBase):
         length_penalty=1.0,
         num_captions=1,
         temperature=1,
+        target_lang='French',
         **kwargs
     ):
         import gc
         
         self.llama_model.eval()
-        
-        lang = 'Russian'
+    
         speech = samples["source"]
         
         if self.speech_encoder_model == 'speechtokenizer':
@@ -399,7 +399,7 @@ class SparQLeLLMInstruct(SparQLeBase):
                 current_inputs_llama_query = inputs_llama_query.clone()
                 current_atts_llama_query = atts_llama_query.clone()
                 
-                prompt = prompt.replace('TARGETLANG', lang)
+                prompt = prompt.replace('TARGETLANG', target_lang)
                 current_inputs_llama_query, _ = self.prompt_wrap(
                     current_inputs_llama_query, current_atts_llama_query, prompt
                 )
@@ -432,7 +432,7 @@ class SparQLeLLMInstruct(SparQLeBase):
                 output_text = [text.strip() for text in output_text]
                 all_results.extend(output_text)
                 
-                print(output_text[0])
+                # print(output_text[0])
                 
                 del outputs, output_text, inputs_embeds, attention_mask
                 del current_inputs_llama_query, current_atts_llama_query
@@ -442,7 +442,7 @@ class SparQLeLLMInstruct(SparQLeBase):
         del inputs_llama_query, atts_llama_query, bos_embeds, beg_embds, aft_embds
         torch.cuda.empty_cache()
         gc.collect()
-        print('#######################################################')
+        # print('#######################################################')
         return all_results
         
         
