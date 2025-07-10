@@ -1,8 +1,8 @@
 # SparQLe
 
-SparQLe is a speech understanding and processing framework that integrates query-former (Qformer) architecture with large language models for speech-to-text applications. List all available pretrained weights for the model SparQLe from Hugging Face Model Hub.
-- [SparQLe_best]([url](https://huggingface.co/amupd/SparQLe/blob/main/SparQLe_best.pt))
-- [SparQLe_last]([url](https://huggingface.co/amupd/SparQLe/blob/main/SparQLe_last.pt))
+SparQLe is a speech understanding and processing framework that integrates query-former (Qformer) architecture with large language models for speech-to-text applications. List all available trained weights for the model SparQLe from Hugging Face Model Hub.
+- [SparQLe - best](https://huggingface.co/amupd/SparQLe/blob/main/SparQLe_best.pt)
+- [SparQLe - last](https://huggingface.co/amupd/SparQLe/blob/main/SparQLe_last.pt)
 
 ---
 
