@@ -1,10 +1,12 @@
 # SparQLe
 
-SparQLe is a speech understanding and processing framework that integrates query-former (Qformer) architecture with large language models for speech-to-text applications.
+SparQLe is a speech understanding and processing framework that integrates query-former (Qformer) architecture with large language models for speech-to-text applications. List all available pretrained weights for the model SparQLe from Hugging Face Model Hub.
+- [SparQLe_best]([url](https://huggingface.co/amupd/SparQLe/blob/main/SparQLe_best.pt))
+- [SparQLe_last]([url](https://huggingface.co/amupd/SparQLe/blob/main/SparQLe_last.pt))
 
 ---
 
-## 📂 Repository Structure
+## Repository Structure
 
 The repository consists of two main components:
 
@@ -37,17 +39,17 @@ SparQLe-hf/
 
 ---
 
-## 🚀 Features
+## Features
 
-- 🎙️ Speech-to-text conversion using Qformer architecture
-- 🤝 Integration with large language models
-- 🗄️ Support for raw audio and feature-based inputs
-- 🔄 Fine-tuning capabilities for different downstream tasks
-- 🧩 Modular architecture for experimentation
+- Speech-to-text conversion using Qformer architecture
+- Integration with large language models
+- Support for raw audio and feature-based inputs
+- Fine-tuning capabilities for different downstream tasks
+- Modular architecture for experimentation
 
 ---
 
-## 🛠️ Installation
+## Installation
 
 ### Prerequisites
 
@@ -74,7 +76,7 @@ pip install -r requirements.txt
 
 ---
 
-## 🏋️ Training
+## Training
 
 ### Pretraining the Qformer (Stage 1)
 
@@ -92,35 +94,13 @@ cd SparQLe-hf
 
 ---
 
-## 🤖 Inference
+## Inference
 
 ```python
 # TODO: Add inference example
 ```
 
----
-
-## 🏛️ Model Architecture
-
-SparQLe uses a query-former (Qformer) architecture that bridges speech encoders with language models. The pipeline consists of:
-
-1. **Speech Pre-net**: Processes raw audio or features 🎧
-2. **Qformer**: Transforms speech representations into a format suitable for LLMs 🔍
-3. **Language Model**: Generates text outputs based on speech representations 📝
-
----
-
-## 📈 Training Pipeline
-
-The training process is divided into multiple stages:
-
-1. **Pretrain 1**: Train the speech encoder and Qformer components 🏗️
-2. **Pretrain 2**: Integrate with frozen LLM components ❄️
-3. **Fine-tuning**: Fine-tune the entire model for specific tasks 🎯
-
----
-
-## 🎓 Citation
+## Citation
 
 If you use SparQLe in your research, please cite:
 
@@ -140,13 +120,13 @@ If you use SparQLe in your research, please cite:
 
 ---
 
-## 📜 License
+## License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
 ---
 
-## 🙏 Acknowledgments
+## Acknowledgments
 
 - This work builds upon [fairseq](https://github.com/facebookresearch/fairseq) 💙
 - The Qformer architecture is inspired by [BLIP-2](https://github.com/salesforce/BLIP-2) ✨
