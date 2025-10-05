@@ -1,9 +1,21 @@
-# SparQLe
 
-SparQLe is a speech understanding and processing framework that integrates query-former (Qformer) architecture with large language models for speech-to-text applications. List all available trained weights for the model SparQLe from Hugging Face Model Hub.
-- [SparQLe - best](https://huggingface.co/amupd/SparQLe/blob/main/SparQLe_best.pt)
-- [SparQLe - last](https://huggingface.co/amupd/SparQLe/blob/main/SparQLe_last.pt)
+<a href=''> <a href='https://aclanthology.org/2025.iwslt-1.6/'><img src='https://img.shields.io/badge/paper-Paper-red'></a>
+[![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
+[![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-red.svg)](https://pytorch.org/)
 
+This repository contains implementation code for speech and large language model integration for speech to text translation task, SparQLe. SparQLe is a speech understanding and processing framework that integrates query-former (Qformer) architecture with large language models for speech-to-text applications.
+
+## Overview
+With the growing influence of Large Language Models (LLMs), there is increasing interest in integrating speech representations with them to enable more seamless multi-modal processing and speech understanding. This study introduces a novel approach that combines self-supervised speech representations with instruction-tuned LLMs for speech-to-text translation. The proposed approach leverages a modality adapter to align extracted speech features with instruction-tuned LLMs using English speech data. Our experiments demonstrate that this method effectively preserves the semantic content of the input speech and serves as an effective bridge between self-supervised speech models and instruction-tuned LLMs, offering a promising approach for various speech understanding applications.
+
+List of available trained weights for the model SparQLe from Hugging Face Model Hub: [SparQLe - best](https://huggingface.co/amupd/SparQLe/blob/main/SparQLe_best.pt), [SparQLe - last](https://huggingface.co/amupd/SparQLe/blob/main/SparQLe_last.pt)
+
+### Key Contributions
+
+- **Modality Adapter**: Enables efficient text extraction from speech signals, bridging the gap between audio and language representations.
+- **Multi-Model Support**: Compatible with various speech self-supervised learning (SSL) or encoder networks, allowing flexible integration across architectures.
+- **Zero-Shot Translation for Low-Resource Languages**: Leverages LLM integration to translate speech inputs from input language (English) into languages supported by the model without requiring parallel data.
 ---
 
 ## Repository Structure
@@ -39,26 +51,9 @@ SparQLe-hf/
 
 ---
 
-## Features
-
-- Speech-to-text conversion using Qformer architecture
-- Integration with large language models
-- Support for raw audio and feature-based inputs
-- Fine-tuning capabilities for different downstream tasks
-- Modular architecture for experimentation
-
----
-
-## Installation
+## Usage
 
 ### Prerequisites
-
-- Python 3.8+
-- PyTorch 1.10+
-- fairseq
-- transformers
-
-### Setup
 
 ```bash
 # Clone the repository
@@ -76,28 +71,9 @@ pip install -r requirements.txt
 
 ---
 
-## Training
-
-### Pretraining the Qformer (Stage 1)
-
-```bash
-cd SparQLe-hf
-# Add your pretraining commands here...
-```
-
-### Fine-tuning with LLM (Stage 2)
-
-```bash
-cd SparQLe-hf
-# Add your fine-tuning commands here...
-```
-
----
-
-## Inference
-
+### Inference 
 ```python
-# TODO: Add inference example
+python "SparQLe-gradio/app.py"
 ```
 
 ## Citation
@@ -105,29 +81,29 @@ cd SparQLe-hf
 If you use SparQLe in your research, please cite:
 
 ```bibtex
-@misc{djanibekov2025sparqlespeechqueriestext,
-      title={SparQLe: Speech Queries to Text Translation Through LLMs},
-      author={Amirbek Djanibekov and Hanan Aldarmaki},
-      year={2025},
-      eprint={2502.09284},
-      archivePrefix={arXiv},
-      primaryClass={cs.CL},
-      url={https://arxiv.org/abs/2502.09284},
+@inproceedings{djanibekov-aldarmaki-2025-sparqle,
+    title = "{S}par{QL}e: Speech Queries to Text Translation Through {LLM}s",
+    author = "Djanibekov, Amirbek  and
+      Aldarmaki, Hanan",
+    editor = "Salesky, Elizabeth  and
+      Federico, Marcello  and
+      Anastasopoulos, Antonis",
+    booktitle = "Proceedings of the 22nd International Conference on Spoken Language Translation (IWSLT 2025)",
+    month = jul,
+    year = "2025",
+    address = "Vienna, Austria (in-person and online)",
+    publisher = "Association for Computational Linguistics",
+    url = "https://aclanthology.org/2025.iwslt-1.6/",
+    doi = "10.18653/v1/2025.iwslt-1.6",
+    pages = "76--83",
+    ISBN = "979-8-89176-272-5",
+    abstract = "With the growing influence of Large Language Models (LLMs), there is increasing interest in integrating speech representations with them to enable more seamless multi-modal processing and speech understanding. This study introduces a novel approach that combines self-supervised speech representations with instruction-tuned LLMs for speech-to-text translation. The proposed approach leverages a modality adapter to align extracted speech features with instruction-tuned LLMs using English speech data. Our experiments demonstrate that this method effectively preserves the semantic content of the input speech and serves as an effective bridge between self-supervised speech models and instruction-tuned LLMs, offering a promising approach for various speech understanding applications."
 }
 ```
-
-📄 Read the full paper on arXiv: [https://arxiv.org/abs/2502.09284](https://arxiv.org/abs/2502.09284)
-
----
-
-## License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
 ---
 
 ## Acknowledgments
 
-- This work builds upon [fairseq](https://github.com/facebookresearch/fairseq) 💙
-- The Qformer architecture is inspired by [BLIP-2](https://github.com/salesforce/BLIP-2) ✨
+- This work builds upon [fairseq](https://github.com/facebookresearch/fairseq)
+- The Qformer architecture is inspired by [BLIP-2](https://github.com/salesforce/BLIP-2)
 
